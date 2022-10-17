@@ -1,0 +1,35 @@
+android-platform-external-boringssl (10.0.0+r36-1) unstable; urgency=medium
+
+  * Team upload
+  * New upstream version
+  * Upstream (10.0.0+r36) (Closes: #933865)
+
+ -- Dhyey Patel <griffin98@protonmail.com>  Mon, 23 Nov 2020 12:14:17 +0100
+
+android-platform-external-boringssl (8.1.0+r23-3) unstable; urgency=medium
+
+  [ Kai-Chung Yan (殷啟聰) ]
+  * d/copyright: Refer to the Apache-2.0 in the commons-licenses
+
+  [ Roger Shimizu ]
+  * d/watch: Update rule to get new upstream version
+
+  [ Hans-Christoph Steiner ]
+  * fix adb crashes on startup on armhf (Closes: #933865)
+
+ -- Hans-Christoph Steiner <hans@eds.org>  Thu, 08 Oct 2020 19:35:08 +0200
+
+android-platform-external-boringssl (8.1.0+r23-2) unstable; urgency=medium
+
+  * Update d/copyright:
+    * Cover all copyright holders (Closes: #905820)
+    * Point the Source to AOSP
+  * Standards-Version => 4.2.1
+
+ -- Kai-Chung Yan <seamlikok@gmail.com>  Fri, 21 Sep 2018 16:43:18 +0800
+
+android-platform-external-boringssl (8.1.0+r23-1) unstable; urgency=medium
+
+  * Initial release (Closes: #823933)
+
+ -- Kai-Chung Yan <seamlikok@gmail.com>  Mon, 28 May 2018 19:53:05 +0200

@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/pkg-info.mk
+
+export DEB_LDFLAGS_MAINT_APPEND = -fPIC
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+override_dh_auto_build:
+	dh_auto_build --buildsystem=makefile -- -f debian/libcrypto.mk
+	dh_auto_build --buildsystem=makefile -- -f debian/libssl.mk

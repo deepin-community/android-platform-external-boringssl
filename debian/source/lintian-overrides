@@ -1,0 +1,5 @@
+# These are only test files for the ar implementation in Go.
+source: source-is-missing src/util/ar/testdata/linux/bar.cc.o
+source: source-is-missing src/util/ar/testdata/linux/foo.c.o
+source: source-contains-prebuilt-binary src/util/ar/testdata/linux/bar.cc.o
+source: source-contains-prebuilt-binary src/util/ar/testdata/linux/foo.c.o

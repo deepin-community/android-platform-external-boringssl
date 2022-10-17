@@ -1,0 +1,12 @@
+pages:
+  image: registry.salsa.debian.org/salsa-ci-team/ci-image-git-buildpackage
+  stage: deploy
+  only:
+    - master
+  artifacts:
+    paths:
+      - public
+    expire_in: 1 day
+  script:
+    - gitlab-ci-git-buildpackage-all
+    - gitlab-ci-aptly
