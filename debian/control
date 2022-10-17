@@ -1,0 +1,57 @@
+Source: android-platform-external-boringssl
+Section: libs
+Priority: optional
+Maintainer: Android Tools Maintainers <android-tools-devel@lists.alioth.debian.org>
+Uploaders: Kai-Chung Yan <seamlikok@gmail.com>
+Build-Depends: debhelper-compat (= 12),
+               dh-exec,
+Standards-Version: 4.5.0
+Rules-Requires-Root: no
+Vcs-Git: https://salsa.debian.org/android-tools-team/android-platform-external-boringssl.git
+Vcs-Browser: https://salsa.debian.org/android-tools-team/android-platform-external-boringssl
+Homepage: https://android.googlesource.com/platform/external/boringssl
+
+Package: android-libboringssl
+Architecture: armel armhf arm64 amd64 i386 ppc64el
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: Google's internal fork of OpenSSL for the Android SDK
+ The Android SDK builds against a static version of BoringSSL,
+ Google's internal fork of OpenSSL.  This package should never be used
+ for anything but Android SDK packages that already depend on it.
+ .
+ BoringSSL arose because Google used OpenSSL for many years in various
+ ways and, over time, built up a large number of patches that were
+ maintained while tracking upstream OpenSSL. As Google’s product
+ portfolio became more complex, more copies of OpenSSL sprung up and
+ the effort involved in maintaining all these patches in multiple
+ places was growing steadily.
+ .
+ This is the Android AOSP fork of BoringSSL which is designed to be
+ used by Android and its SDK.  BoringSSL is only ever statically linked
+ into apps, and pinned to a commit version.  Upstream has no official
+ releases of BoringSSL on its own, so it must be included separately
+ for each project that uses it.
+
+Package: android-libboringssl-dev
+Section: libdevel
+Architecture: armel armhf arm64 amd64 i386 ppc64el
+Depends: android-libboringssl (= ${binary:Version}), ${misc:Depends}
+Description: Google's internal fork of OpenSSL for the Android SDK - devel
+ The Android SDK builds against a static version of BoringSSL,
+ Google's internal fork of OpenSSL.  This package should never be used
+ for anything but Android SDK packages that already depend on it.
+ .
+ BoringSSL arose because Google used OpenSSL for many years in various
+ ways and, over time, built up a large number of patches that were
+ maintained while tracking upstream OpenSSL. As Google’s product
+ portfolio became more complex, more copies of OpenSSL sprung up and
+ the effort involved in maintaining all these patches in multiple
+ places was growing steadily.
+ .
+ This is the Android AOSP fork of BoringSSL which is designed to be
+ used by Android and its SDK.  BoringSSL is only ever statically linked
+ into apps, and pinned to a commit version.  Upstream has no official
+ releases of BoringSSL on its own, so it must be included separately
+ for each project that uses it.
+ .
+ This package contains the development files.
