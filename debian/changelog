@@ -1,3 +1,10 @@
+android-platform-external-boringssl (10.0.0+r36-2) unstable; urgency=medium
+
+  [ Dhyey Patel ]
+  * UNRELEASED
+
+ -- Deepin Packages Builder <packages@deepin.org>  Wed, 21 Dec 2022 15:13:25 +0800
+
 android-platform-external-boringssl (10.0.0+r36-1) unstable; urgency=medium
 
   * Team upload
