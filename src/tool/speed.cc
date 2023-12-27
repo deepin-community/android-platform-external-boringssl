@@ -13,30 +13,39 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 
 #include <algorithm>
-#include <string>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <openssl/aead.h>
+#include <openssl/aes.h>
+#include <openssl/base64.h>
 #include <openssl/bn.h>
+#include <openssl/bytestring.h>
+#include <openssl/crypto.h>
 #include <openssl/curve25519.h>
 #include <openssl/digest.h>
-#include <openssl/err.h>
 #include <openssl/ec.h>
-#include <openssl/ecdsa.h>
 #include <openssl/ec_key.h>
+#include <openssl/ecdsa.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hrss.h>
+#include <openssl/kyber.h>
+#include <openssl/mem.h>
 #include <openssl/nid.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
+#include <openssl/siphash.h>
+#include <openssl/trust_token.h>
 
 #if defined(OPENSSL_WINDOWS)
 OPENSSL_MSVC_PRAGMA(warning(push, 3))
@@ -48,30 +57,74 @@ OPENSSL_MSVC_PRAGMA(warning(pop))
 #include <time.h>
 #endif
 
+#include "../crypto/ec_extra/internal.h"
+#include "../crypto/fipsmodule/ec/internal.h"
 #include "../crypto/internal.h"
+#include "../crypto/trust_token/internal.h"
 #include "internal.h"
 
+// g_print_json is true if printed output is JSON formatted.
+static bool g_print_json = false;
 
 // TimeResults represents the results of benchmarking a function.
 struct TimeResults {
   // num_calls is the number of function calls done in the time period.
-  unsigned num_calls;
+  uint64_t num_calls;
   // us is the number of microseconds that elapsed in the time period.
-  unsigned us;
+  uint64_t us;
 
-  void Print(const std::string &description) {
-    printf("Did %u %s operations in %uus (%.1f ops/sec)\n", num_calls,
-           description.c_str(), us,
-           (static_cast<double>(num_calls) / us) * 1000000);
+  void Print(const std::string &description) const {
+    if (g_print_json) {
+      PrintJSON(description);
+    } else {
+      printf(
+          "Did %" PRIu64 " %s operations in %" PRIu64 "us (%.1f ops/sec)\n",
+          num_calls, description.c_str(), us,
+          (static_cast<double>(num_calls) / static_cast<double>(us)) * 1000000);
+    }
   }
 
-  void PrintWithBytes(const std::string &description, size_t bytes_per_call) {
-    printf("Did %u %s operations in %uus (%.1f ops/sec): %.1f MB/s\n",
-           num_calls, description.c_str(), us,
-           (static_cast<double>(num_calls) / us) * 1000000,
-           static_cast<double>(bytes_per_call * num_calls) / us);
+  void PrintWithBytes(const std::string &description,
+                      size_t bytes_per_call) const {
+    if (g_print_json) {
+      PrintJSON(description, bytes_per_call);
+    } else {
+      printf(
+          "Did %" PRIu64 " %s operations in %" PRIu64
+          "us (%.1f ops/sec): %.1f MB/s\n",
+          num_calls, description.c_str(), us,
+          (static_cast<double>(num_calls) / static_cast<double>(us)) * 1000000,
+          static_cast<double>(bytes_per_call * num_calls) /
+              static_cast<double>(us));
+    }
   }
+
+ private:
+  void PrintJSON(const std::string &description,
+                 size_t bytes_per_call = 0) const {
+    if (first_json_printed) {
+      puts(",");
+    }
+
+    printf("{\"description\": \"%s\", \"numCalls\": %" PRIu64
+           ", \"microseconds\": %" PRIu64,
+           description.c_str(), num_calls, us);
+
+    if (bytes_per_call > 0) {
+      printf(", \"bytesPerCall\": %zu", bytes_per_call);
+    }
+
+    printf("}");
+    first_json_printed = true;
+  }
+
+  // first_json_printed is true if |g_print_json| is true and the first item in
+  // the JSON results has been printed already. This is used to handle the
+  // commas between each item in the result list.
+  static bool first_json_printed;
 };
+
+bool TimeResults::first_json_printed = false;
 
 #if defined(OPENSSL_WINDOWS)
 static uint64_t time_now() { return GetTickCount64() * 1000; }
@@ -106,13 +159,13 @@ static bool TimeFunction(TimeResults *results, std::function<bool()> func) {
   // for.
   const uint64_t total_us = g_timeout_seconds * 1000000;
   uint64_t start = time_now(), now, delta;
-  unsigned done = 0, iterations_between_time_checks;
 
   if (!func()) {
     return false;
   }
   now = time_now();
   delta = now - start;
+  unsigned iterations_between_time_checks;
   if (delta == 0) {
     iterations_between_time_checks = 250;
   } else {
@@ -126,6 +179,7 @@ static bool TimeFunction(TimeResults *results, std::function<bool()> func) {
     }
   }
 
+  uint64_t done = 0;
   for (;;) {
     for (unsigned i = 0; i < iterations_between_time_checks; i++) {
       if (!func()) {
@@ -159,7 +213,7 @@ static bool SpeedRSA(const std::string &selected) {
     {"RSA 4096", kDERRSAPrivate4096, kDERRSAPrivate4096Len},
   };
 
-  for (unsigned i = 0; i < OPENSSL_ARRAY_SIZE(kRSAKeys); i++) {
+  for (size_t i = 0; i < OPENSSL_ARRAY_SIZE(kRSAKeys); i++) {
     const std::string name = kRSAKeys[i].name;
 
     bssl::UniquePtr<RSA> key(
@@ -227,6 +281,16 @@ static bool SpeedRSA(const std::string &selected) {
       return false;
     }
     results.Print(name + " verify (fresh key)");
+
+    if (!TimeFunction(&results, [&]() -> bool {
+          return bssl::UniquePtr<RSA>(RSA_private_key_from_bytes(
+                     kRSAKeys[i].key, kRSAKeys[i].key_len)) != nullptr;
+        })) {
+      fprintf(stderr, "Failed to parse %s key.\n", name.c_str());
+      ERR_print_errors_fp(stderr);
+      return false;
+    }
+    results.Print(name + " private key parse");
   }
 
   return true;
@@ -246,9 +310,9 @@ static bool SpeedRSAKeyGen(const std::string &selected) {
   const std::vector<int> kSizes = {2048, 3072, 4096};
   for (int size : kSizes) {
     const uint64_t start = time_now();
-    unsigned num_calls = 0;
-    unsigned us;
-    std::vector<unsigned> durations;
+    uint64_t num_calls = 0;
+    uint64_t us;
+    std::vector<uint64_t> durations;
 
     for (;;) {
       bssl::UniquePtr<RSA> rsa(RSA_new());
@@ -271,33 +335,27 @@ static bool SpeedRSAKeyGen(const std::string &selected) {
     }
 
     std::sort(durations.begin(), durations.end());
-    printf("Did %u RSA %d key-gen operations in %uus (%.1f ops/sec)\n",
-           num_calls, size, us,
-           (static_cast<double>(num_calls) / us) * 1000000);
+    const std::string description =
+        std::string("RSA ") + std::to_string(size) + std::string(" key-gen");
+    const TimeResults results = {num_calls, us};
+    results.Print(description);
     const size_t n = durations.size();
     assert(n > 0);
 
-    // |min| and |max| must be stored in temporary variables to avoid an MSVC
-    // bug on x86. There, size_t is a typedef for unsigned, but MSVC's printf
-    // warning tries to retain the distinction and suggest %zu for size_t
-    // instead of %u. It gets confused if std::vector<unsigned> and
-    // std::vector<size_t> are both instantiated. Being typedefs, the two
-    // instantiations are identical, which somehow breaks the size_t vs unsigned
-    // metadata.
-    unsigned min = durations[0];
-    unsigned median = n & 1 ? durations[n / 2]
-                            : (durations[n / 2 - 1] + durations[n / 2]) / 2;
-    unsigned max = durations[n - 1];
-    printf("  min: %uus, median: %uus, max: %uus\n", min, median, max);
+    // Distribution information is useful, but doesn't fit into the standard
+    // format used by |g_print_json|.
+    if (!g_print_json) {
+      uint64_t min = durations[0];
+      uint64_t median = n & 1 ? durations[n / 2]
+                              : (durations[n / 2 - 1] + durations[n / 2]) / 2;
+      uint64_t max = durations[n - 1];
+      printf("  min: %" PRIu64 "us, median: %" PRIu64 "us, max: %" PRIu64
+             "us\n",
+             min, median, max);
+    }
   }
 
   return true;
-}
-
-static uint8_t *align(uint8_t *in, unsigned alignment) {
-  return reinterpret_cast<uint8_t *>(
-      (reinterpret_cast<uintptr_t>(in) + alignment) &
-      ~static_cast<size_t>(alignment - 1));
 }
 
 static std::string ChunkLenSuffix(size_t chunk_len) {
@@ -336,13 +394,17 @@ static bool SpeedAEADChunk(const EVP_AEAD *aead, std::string name,
       new uint8_t[overhead_len + kAlignment]);
 
 
-  uint8_t *const in = align(in_storage.get(), kAlignment);
+  uint8_t *const in =
+      static_cast<uint8_t *>(align_pointer(in_storage.get(), kAlignment));
   OPENSSL_memset(in, 0, chunk_len);
-  uint8_t *const out = align(out_storage.get(), kAlignment);
+  uint8_t *const out =
+      static_cast<uint8_t *>(align_pointer(out_storage.get(), kAlignment));
   OPENSSL_memset(out, 0, chunk_len + overhead_len);
-  uint8_t *const tag = align(tag_storage.get(), kAlignment);
+  uint8_t *const tag =
+      static_cast<uint8_t *>(align_pointer(tag_storage.get(), kAlignment));
   OPENSSL_memset(tag, 0, overhead_len);
-  uint8_t *const in2 = align(in2_storage.get(), kAlignment);
+  uint8_t *const in2 =
+      static_cast<uint8_t *>(align_pointer(in2_storage.get(), kAlignment));
 
   if (!EVP_AEAD_CTX_init_with_direction(ctx.get(), aead, key.get(), key_len,
                                         EVP_AEAD_DEFAULT_TAG_LENGTH,
@@ -432,23 +494,92 @@ static bool SpeedAEADOpen(const EVP_AEAD *aead, const std::string &name,
   return true;
 }
 
+static bool SpeedAESBlock(const std::string &name, unsigned bits,
+                          const std::string &selected) {
+  if (!selected.empty() && name.find(selected) == std::string::npos) {
+    return true;
+  }
+
+  static const uint8_t kZero[32] = {0};
+
+  {
+    TimeResults results;
+    if (!TimeFunction(&results, [&]() -> bool {
+          AES_KEY key;
+          return AES_set_encrypt_key(kZero, bits, &key) == 0;
+        })) {
+      fprintf(stderr, "AES_set_encrypt_key failed.\n");
+      return false;
+    }
+    results.Print(name + " encrypt setup");
+  }
+
+  {
+    AES_KEY key;
+    if (AES_set_encrypt_key(kZero, bits, &key) != 0) {
+      return false;
+    }
+    uint8_t block[16] = {0};
+    TimeResults results;
+    if (!TimeFunction(&results, [&]() -> bool {
+          AES_encrypt(block, block, &key);
+          return true;
+        })) {
+      fprintf(stderr, "AES_encrypt failed.\n");
+      return false;
+    }
+    results.Print(name + " encrypt");
+  }
+
+  {
+    TimeResults results;
+    if (!TimeFunction(&results, [&]() -> bool {
+          AES_KEY key;
+          return AES_set_decrypt_key(kZero, bits, &key) == 0;
+        })) {
+      fprintf(stderr, "AES_set_decrypt_key failed.\n");
+      return false;
+    }
+    results.Print(name + " decrypt setup");
+  }
+
+  {
+    AES_KEY key;
+    if (AES_set_decrypt_key(kZero, bits, &key) != 0) {
+      return false;
+    }
+    uint8_t block[16] = {0};
+    TimeResults results;
+    if (!TimeFunction(&results, [&]() -> bool {
+          AES_decrypt(block, block, &key);
+          return true;
+        })) {
+      fprintf(stderr, "AES_decrypt failed.\n");
+      return false;
+    }
+    results.Print(name + " decrypt");
+  }
+
+  return true;
+}
+
 static bool SpeedHashChunk(const EVP_MD *md, std::string name,
                            size_t chunk_len) {
   bssl::ScopedEVP_MD_CTX ctx;
-  uint8_t scratch[8192];
+  uint8_t input[16384] = {0};
 
-  if (chunk_len > sizeof(scratch)) {
+  if (chunk_len > sizeof(input)) {
     return false;
   }
 
   name += ChunkLenSuffix(chunk_len);
   TimeResults results;
-  if (!TimeFunction(&results, [&ctx, md, chunk_len, &scratch]() -> bool {
+  if (!TimeFunction(&results, [&ctx, md, chunk_len, &input]() -> bool {
         uint8_t digest[EVP_MAX_MD_SIZE];
         unsigned int md_len;
 
         return EVP_DigestInit_ex(ctx.get(), md, NULL /* ENGINE */) &&
-               EVP_DigestUpdate(ctx.get(), scratch, chunk_len) &&
+               EVP_DigestUpdate(ctx.get(), input, chunk_len) &&
                EVP_DigestFinal_ex(ctx.get(), digest, &md_len);
       })) {
     fprintf(stderr, "EVP_DigestInit_ex failed.\n");
@@ -476,7 +607,7 @@ static bool SpeedHash(const EVP_MD *md, const std::string &name,
 }
 
 static bool SpeedRandomChunk(std::string name, size_t chunk_len) {
-  uint8_t scratch[8192];
+  uint8_t scratch[16384];
 
   if (chunk_len > sizeof(scratch)) {
     return false;
@@ -546,17 +677,14 @@ static bool SpeedECDHCurve(const std::string &name, int nid,
         bssl::UniquePtr<EC_POINT> point(EC_POINT_new(group));
         bssl::UniquePtr<EC_POINT> peer_point(EC_POINT_new(group));
         bssl::UniquePtr<BN_CTX> ctx(BN_CTX_new());
-
         bssl::UniquePtr<BIGNUM> x(BN_new());
-        bssl::UniquePtr<BIGNUM> y(BN_new());
-
-        if (!point || !peer_point || !ctx || !x || !y ||
+        if (!point || !peer_point || !ctx || !x ||
             !EC_POINT_oct2point(group, peer_point.get(), peer_value.get(),
                                 peer_value_len, ctx.get()) ||
-            !EC_POINT_mul(group, point.get(), NULL, peer_point.get(),
+            !EC_POINT_mul(group, point.get(), nullptr, peer_point.get(),
                           EC_KEY_get0_private_key(key.get()), ctx.get()) ||
             !EC_POINT_get_affine_coordinates_GFp(group, point.get(), x.get(),
-                                                 y.get(), ctx.get())) {
+                                                 nullptr, ctx.get())) {
           return false;
         }
 
@@ -784,13 +912,12 @@ static bool SpeedHRSS(const std::string &selected) {
   TimeResults results;
 
   if (!TimeFunction(&results, []() -> bool {
-    struct HRSS_public_key pub;
-    struct HRSS_private_key priv;
-    uint8_t entropy[HRSS_GENERATE_KEY_BYTES];
-    RAND_bytes(entropy, sizeof(entropy));
-    HRSS_generate_key(&pub, &priv, entropy);
-    return true;
-  })) {
+        struct HRSS_public_key pub;
+        struct HRSS_private_key priv;
+        uint8_t entropy[HRSS_GENERATE_KEY_BYTES];
+        RAND_bytes(entropy, sizeof(entropy));
+        return HRSS_generate_key(&pub, &priv, entropy);
+      })) {
     fprintf(stderr, "Failed to time HRSS_generate_key.\n");
     return false;
   }
@@ -801,16 +928,17 @@ static bool SpeedHRSS(const std::string &selected) {
   struct HRSS_private_key priv;
   uint8_t key_entropy[HRSS_GENERATE_KEY_BYTES];
   RAND_bytes(key_entropy, sizeof(key_entropy));
-  HRSS_generate_key(&pub, &priv, key_entropy);
+  if (!HRSS_generate_key(&pub, &priv, key_entropy)) {
+    return false;
+  }
 
   uint8_t ciphertext[HRSS_CIPHERTEXT_BYTES];
   if (!TimeFunction(&results, [&pub, &ciphertext]() -> bool {
-    uint8_t entropy[HRSS_ENCAP_BYTES];
-    uint8_t shared_key[HRSS_KEY_BYTES];
-    RAND_bytes(entropy, sizeof(entropy));
-    HRSS_encap(ciphertext, shared_key, &pub, entropy);
-    return true;
-  })) {
+        uint8_t entropy[HRSS_ENCAP_BYTES];
+        uint8_t shared_key[HRSS_KEY_BYTES];
+        RAND_bytes(entropy, sizeof(entropy));
+        return HRSS_encap(ciphertext, shared_key, &pub, entropy);
+      })) {
     fprintf(stderr, "Failed to time HRSS_encap.\n");
     return false;
   }
@@ -818,10 +946,9 @@ static bool SpeedHRSS(const std::string &selected) {
   results.Print("HRSS encap");
 
   if (!TimeFunction(&results, [&priv, &ciphertext]() -> bool {
-    uint8_t shared_key[HRSS_KEY_BYTES];
-    HRSS_decap(shared_key, &priv, ciphertext, sizeof(ciphertext));
-    return true;
-  })) {
+        uint8_t shared_key[HRSS_KEY_BYTES];
+        return HRSS_decap(shared_key, &priv, ciphertext, sizeof(ciphertext));
+      })) {
     fprintf(stderr, "Failed to time HRSS_encap.\n");
     return false;
   }
@@ -830,6 +957,404 @@ static bool SpeedHRSS(const std::string &selected) {
 
   return true;
 }
+
+static bool SpeedKyber(const std::string &selected) {
+  if (!selected.empty() && selected != "Kyber") {
+    return true;
+  }
+
+  TimeResults results;
+
+  KYBER_private_key priv;
+  uint8_t encoded_public_key[KYBER_PUBLIC_KEY_BYTES];
+  uint8_t ciphertext[KYBER_CIPHERTEXT_BYTES];
+  // This ciphertext is nonsense, but Kyber decap is constant-time so, for the
+  // purposes of timing, it's fine.
+  memset(ciphertext, 42, sizeof(ciphertext));
+  if (!TimeFunction(&results,
+                    [&priv, &encoded_public_key, &ciphertext]() -> bool {
+                      uint8_t shared_secret[32];
+                      KYBER_generate_key(encoded_public_key, &priv);
+                      KYBER_decap(shared_secret, sizeof(shared_secret),
+                                  ciphertext, &priv);
+                      return true;
+                    })) {
+    fprintf(stderr, "Failed to time KYBER_generate_key + KYBER_decap.\n");
+    return false;
+  }
+
+  results.Print("Kyber generate + decap");
+
+  KYBER_public_key pub;
+  if (!TimeFunction(
+          &results, [&pub, &ciphertext, &encoded_public_key]() -> bool {
+            CBS encoded_public_key_cbs;
+            CBS_init(&encoded_public_key_cbs, encoded_public_key,
+                     sizeof(encoded_public_key));
+            if (!KYBER_parse_public_key(&pub, &encoded_public_key_cbs)) {
+              return false;
+            }
+            uint8_t shared_secret[32];
+            KYBER_encap(ciphertext, shared_secret, sizeof(shared_secret), &pub);
+            return true;
+          })) {
+    fprintf(stderr, "Failed to time KYBER_encap.\n");
+    return false;
+  }
+
+  results.Print("Kyber parse + encap");
+
+  return true;
+}
+
+static bool SpeedHashToCurve(const std::string &selected) {
+  if (!selected.empty() && selected.find("hashtocurve") == std::string::npos) {
+    return true;
+  }
+
+  uint8_t input[64];
+  RAND_bytes(input, sizeof(input));
+
+  static const uint8_t kLabel[] = "label";
+
+  TimeResults results;
+  {
+    const EC_GROUP *p256 = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    if (p256 == NULL) {
+      return false;
+    }
+    if (!TimeFunction(&results, [&]() -> bool {
+          EC_RAW_POINT out;
+          return ec_hash_to_curve_p256_xmd_sha256_sswu(
+              p256, &out, kLabel, sizeof(kLabel), input, sizeof(input));
+        })) {
+      fprintf(stderr, "hash-to-curve failed.\n");
+      return false;
+    }
+    results.Print("hash-to-curve P256_XMD:SHA-256_SSWU_RO_");
+
+    const EC_GROUP *p384 = EC_GROUP_new_by_curve_name(NID_secp384r1);
+    if (p384 == NULL) {
+      return false;
+    }
+    if (!TimeFunction(&results, [&]() -> bool {
+          EC_RAW_POINT out;
+          return ec_hash_to_curve_p384_xmd_sha384_sswu(
+              p384, &out, kLabel, sizeof(kLabel), input, sizeof(input));
+        })) {
+      fprintf(stderr, "hash-to-curve failed.\n");
+      return false;
+    }
+    results.Print("hash-to-curve P384_XMD:SHA-384_SSWU_RO_");
+
+    if (!TimeFunction(&results, [&]() -> bool {
+          EC_SCALAR out;
+          return ec_hash_to_scalar_p384_xmd_sha512_draft07(
+              p384, &out, kLabel, sizeof(kLabel), input, sizeof(input));
+        })) {
+      fprintf(stderr, "hash-to-scalar failed.\n");
+      return false;
+    }
+    results.Print("hash-to-scalar P384_XMD:SHA-512");
+  }
+
+  return true;
+}
+
+static bool SpeedBase64(const std::string &selected) {
+  if (!selected.empty() && selected.find("base64") == std::string::npos) {
+    return true;
+  }
+
+  static const char kInput[] =
+    "MIIDtTCCAp2gAwIBAgIJALW2IrlaBKUhMA0GCSqGSIb3DQEBCwUAMEUxCzAJBgNV"
+    "BAYTAkFVMRMwEQYDVQQIEwpTb21lLVN0YXRlMSEwHwYDVQQKExhJbnRlcm5ldCBX"
+    "aWRnaXRzIFB0eSBMdGQwHhcNMTYwNzA5MDQzODA5WhcNMTYwODA4MDQzODA5WjBF"
+    "MQswCQYDVQQGEwJBVTETMBEGA1UECBMKU29tZS1TdGF0ZTEhMB8GA1UEChMYSW50"
+    "ZXJuZXQgV2lkZ2l0cyBQdHkgTHRkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIB"
+    "CgKCAQEAugvahBkSAUF1fC49vb1bvlPrcl80kop1iLpiuYoz4Qptwy57+EWssZBc"
+    "HprZ5BkWf6PeGZ7F5AX1PyJbGHZLqvMCvViP6pd4MFox/igESISEHEixoiXCzepB"
+    "rhtp5UQSjHD4D4hKtgdMgVxX+LRtwgW3mnu/vBu7rzpr/DS8io99p3lqZ1Aky+aN"
+    "lcMj6MYy8U+YFEevb/V0lRY9oqwmW7BHnXikm/vi6sjIS350U8zb/mRzYeIs2R65"
+    "LUduTL50+UMgat9ocewI2dv8aO9Dph+8NdGtg8LFYyTTHcUxJoMr1PTOgnmET19W"
+    "JH4PrFwk7ZE1QJQQ1L4iKmPeQistuQIDAQABo4GnMIGkMB0GA1UdDgQWBBT5m6Vv"
+    "zYjVYHG30iBE+j2XDhUE8jB1BgNVHSMEbjBsgBT5m6VvzYjVYHG30iBE+j2XDhUE"
+    "8qFJpEcwRTELMAkGA1UEBhMCQVUxEzARBgNVBAgTClNvbWUtU3RhdGUxITAfBgNV"
+    "BAoTGEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZIIJALW2IrlaBKUhMAwGA1UdEwQF"
+    "MAMBAf8wDQYJKoZIhvcNAQELBQADggEBAD7Jg68SArYWlcoHfZAB90Pmyrt5H6D8"
+    "LRi+W2Ri1fBNxREELnezWJ2scjl4UMcsKYp4Pi950gVN+62IgrImcCNvtb5I1Cfy"
+    "/MNNur9ffas6X334D0hYVIQTePyFk3umI+2mJQrtZZyMPIKSY/sYGQHhGGX6wGK+"
+    "GO/og0PQk/Vu6D+GU2XRnDV0YZg1lsAsHd21XryK6fDmNkEMwbIWrts4xc7scRrG"
+    "HWy+iMf6/7p/Ak/SIicM4XSwmlQ8pPxAZPr+E2LoVd9pMpWUwpW2UbtO5wsGTrY5"
+    "sO45tFNN/y+jtUheB1C2ijObG/tXELaiyCdM+S/waeuv0MXtI4xnn1A=";
+
+  std::vector<uint8_t> out(strlen(kInput));
+  size_t len;
+  TimeResults results;
+  if (!TimeFunction(&results, [&]() -> bool {
+        return EVP_DecodeBase64(out.data(), &len, out.size(),
+                                reinterpret_cast<const uint8_t *>(kInput),
+                                strlen(kInput));
+      })) {
+    fprintf(stderr, "base64 decode failed.\n");
+    return false;
+  }
+  results.PrintWithBytes("base64 decode", strlen(kInput));
+  return true;
+}
+
+static bool SpeedSipHash(const std::string &selected) {
+  if (!selected.empty() && selected.find("siphash") == std::string::npos) {
+    return true;
+  }
+
+  uint64_t key[2] = {0};
+  for (size_t len : g_chunk_lengths) {
+    std::vector<uint8_t> input(len);
+    TimeResults results;
+    if (!TimeFunction(&results, [&]() -> bool {
+          SIPHASH_24(key, input.data(), input.size());
+          return true;
+        })) {
+      fprintf(stderr, "SIPHASH_24 failed.\n");
+      ERR_print_errors_fp(stderr);
+      return false;
+    }
+    results.PrintWithBytes("SipHash-2-4" + ChunkLenSuffix(len), len);
+  }
+
+  return true;
+}
+
+static TRUST_TOKEN_PRETOKEN *trust_token_pretoken_dup(
+    const TRUST_TOKEN_PRETOKEN *in) {
+  return static_cast<TRUST_TOKEN_PRETOKEN *>(
+      OPENSSL_memdup(in, sizeof(TRUST_TOKEN_PRETOKEN)));
+}
+
+static bool SpeedTrustToken(std::string name, const TRUST_TOKEN_METHOD *method,
+                            size_t batchsize, const std::string &selected) {
+  if (!selected.empty() && selected.find("trusttoken") == std::string::npos) {
+    return true;
+  }
+
+  TimeResults results;
+  if (!TimeFunction(&results, [&]() -> bool {
+        uint8_t priv_key[TRUST_TOKEN_MAX_PRIVATE_KEY_SIZE];
+        uint8_t pub_key[TRUST_TOKEN_MAX_PUBLIC_KEY_SIZE];
+        size_t priv_key_len, pub_key_len;
+        return TRUST_TOKEN_generate_key(
+            method, priv_key, &priv_key_len, TRUST_TOKEN_MAX_PRIVATE_KEY_SIZE,
+            pub_key, &pub_key_len, TRUST_TOKEN_MAX_PUBLIC_KEY_SIZE, 0);
+      })) {
+    fprintf(stderr, "TRUST_TOKEN_generate_key failed.\n");
+    return false;
+  }
+  results.Print(name + " generate_key");
+
+  bssl::UniquePtr<TRUST_TOKEN_CLIENT> client(
+      TRUST_TOKEN_CLIENT_new(method, batchsize));
+  bssl::UniquePtr<TRUST_TOKEN_ISSUER> issuer(
+      TRUST_TOKEN_ISSUER_new(method, batchsize));
+  uint8_t priv_key[TRUST_TOKEN_MAX_PRIVATE_KEY_SIZE];
+  uint8_t pub_key[TRUST_TOKEN_MAX_PUBLIC_KEY_SIZE];
+  size_t priv_key_len, pub_key_len, key_index;
+  if (!client || !issuer ||
+      !TRUST_TOKEN_generate_key(
+          method, priv_key, &priv_key_len, TRUST_TOKEN_MAX_PRIVATE_KEY_SIZE,
+          pub_key, &pub_key_len, TRUST_TOKEN_MAX_PUBLIC_KEY_SIZE, 0) ||
+      !TRUST_TOKEN_CLIENT_add_key(client.get(), &key_index, pub_key,
+                                  pub_key_len) ||
+      !TRUST_TOKEN_ISSUER_add_key(issuer.get(), priv_key, priv_key_len)) {
+    fprintf(stderr, "failed to generate trust token key.\n");
+    return false;
+  }
+
+  uint8_t public_key[32], private_key[64];
+  ED25519_keypair(public_key, private_key);
+  bssl::UniquePtr<EVP_PKEY> priv(
+      EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, private_key, 32));
+  bssl::UniquePtr<EVP_PKEY> pub(
+      EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, public_key, 32));
+  if (!priv || !pub) {
+    fprintf(stderr, "failed to generate trust token SRR key.\n");
+    return false;
+  }
+
+  TRUST_TOKEN_CLIENT_set_srr_key(client.get(), pub.get());
+  TRUST_TOKEN_ISSUER_set_srr_key(issuer.get(), priv.get());
+  uint8_t metadata_key[32];
+  RAND_bytes(metadata_key, sizeof(metadata_key));
+  if (!TRUST_TOKEN_ISSUER_set_metadata_key(issuer.get(), metadata_key,
+                                           sizeof(metadata_key))) {
+    fprintf(stderr, "failed to generate trust token metadata key.\n");
+    return false;
+  }
+
+  if (!TimeFunction(&results, [&]() -> bool {
+        uint8_t *issue_msg = NULL;
+        size_t msg_len;
+        int ok = TRUST_TOKEN_CLIENT_begin_issuance(client.get(), &issue_msg,
+                                                   &msg_len, batchsize);
+        OPENSSL_free(issue_msg);
+        // Clear pretokens.
+        sk_TRUST_TOKEN_PRETOKEN_pop_free(client->pretokens,
+                                         TRUST_TOKEN_PRETOKEN_free);
+        client->pretokens = sk_TRUST_TOKEN_PRETOKEN_new_null();
+        return ok;
+      })) {
+    fprintf(stderr, "TRUST_TOKEN_CLIENT_begin_issuance failed.\n");
+    return false;
+  }
+  results.Print(name + " begin_issuance");
+
+  uint8_t *issue_msg = NULL;
+  size_t msg_len;
+  if (!TRUST_TOKEN_CLIENT_begin_issuance(client.get(), &issue_msg, &msg_len,
+                                         batchsize)) {
+    fprintf(stderr, "TRUST_TOKEN_CLIENT_begin_issuance failed.\n");
+    return false;
+  }
+  bssl::UniquePtr<uint8_t> free_issue_msg(issue_msg);
+
+  bssl::UniquePtr<STACK_OF(TRUST_TOKEN_PRETOKEN)> pretokens(
+      sk_TRUST_TOKEN_PRETOKEN_deep_copy(client->pretokens,
+                                        trust_token_pretoken_dup,
+                                        TRUST_TOKEN_PRETOKEN_free));
+
+  if (!TimeFunction(&results, [&]() -> bool {
+        uint8_t *issue_resp = NULL;
+        size_t resp_len, tokens_issued;
+        int ok = TRUST_TOKEN_ISSUER_issue(issuer.get(), &issue_resp, &resp_len,
+                                          &tokens_issued, issue_msg, msg_len,
+                                          /*public_metadata=*/0,
+                                          /*private_metadata=*/0,
+                                          /*max_issuance=*/batchsize);
+        OPENSSL_free(issue_resp);
+        return ok;
+      })) {
+    fprintf(stderr, "TRUST_TOKEN_ISSUER_issue failed.\n");
+    return false;
+  }
+  results.Print(name + " issue");
+
+  uint8_t *issue_resp = NULL;
+  size_t resp_len, tokens_issued;
+  if (!TRUST_TOKEN_ISSUER_issue(issuer.get(), &issue_resp, &resp_len,
+                                &tokens_issued, issue_msg, msg_len,
+                                /*public_metadata=*/0, /*private_metadata=*/0,
+                                /*max_issuance=*/batchsize)) {
+    fprintf(stderr, "TRUST_TOKEN_ISSUER_issue failed.\n");
+    return false;
+  }
+  bssl::UniquePtr<uint8_t> free_issue_resp(issue_resp);
+
+  if (!TimeFunction(&results, [&]() -> bool {
+        size_t key_index2;
+        bssl::UniquePtr<STACK_OF(TRUST_TOKEN)> tokens(
+            TRUST_TOKEN_CLIENT_finish_issuance(client.get(), &key_index2,
+                                               issue_resp, resp_len));
+
+        // Reset pretokens.
+        client->pretokens = sk_TRUST_TOKEN_PRETOKEN_deep_copy(
+            pretokens.get(), trust_token_pretoken_dup,
+            TRUST_TOKEN_PRETOKEN_free);
+        return !!tokens;
+      })) {
+    fprintf(stderr, "TRUST_TOKEN_CLIENT_finish_issuance failed.\n");
+    return false;
+  }
+  results.Print(name + " finish_issuance");
+
+  bssl::UniquePtr<STACK_OF(TRUST_TOKEN)> tokens(
+      TRUST_TOKEN_CLIENT_finish_issuance(client.get(), &key_index, issue_resp,
+                                         resp_len));
+  if (!tokens || sk_TRUST_TOKEN_num(tokens.get()) < 1) {
+    fprintf(stderr, "TRUST_TOKEN_CLIENT_finish_issuance failed.\n");
+    return false;
+  }
+
+  const TRUST_TOKEN *token = sk_TRUST_TOKEN_value(tokens.get(), 0);
+
+  const uint8_t kClientData[] = "\x70TEST CLIENT DATA";
+  uint64_t kRedemptionTime = 13374242;
+
+  if (!TimeFunction(&results, [&]() -> bool {
+        uint8_t *redeem_msg = NULL;
+        size_t redeem_msg_len;
+        int ok = TRUST_TOKEN_CLIENT_begin_redemption(
+            client.get(), &redeem_msg, &redeem_msg_len, token, kClientData,
+            sizeof(kClientData) - 1, kRedemptionTime);
+        OPENSSL_free(redeem_msg);
+        return ok;
+      })) {
+    fprintf(stderr, "TRUST_TOKEN_CLIENT_begin_redemption failed.\n");
+    return false;
+  }
+  results.Print(name + " begin_redemption");
+
+  uint8_t *redeem_msg = NULL;
+  size_t redeem_msg_len;
+  if (!TRUST_TOKEN_CLIENT_begin_redemption(
+          client.get(), &redeem_msg, &redeem_msg_len, token, kClientData,
+          sizeof(kClientData) - 1, kRedemptionTime)) {
+    fprintf(stderr, "TRUST_TOKEN_CLIENT_begin_redemption failed.\n");
+    return false;
+  }
+  bssl::UniquePtr<uint8_t> free_redeem_msg(redeem_msg);
+
+  if (!TimeFunction(&results, [&]() -> bool {
+        uint32_t public_value;
+        uint8_t private_value;
+        TRUST_TOKEN *rtoken;
+        uint8_t *client_data = NULL;
+        size_t client_data_len;
+        int ok = TRUST_TOKEN_ISSUER_redeem(
+            issuer.get(), &public_value, &private_value, &rtoken, &client_data,
+            &client_data_len, redeem_msg, redeem_msg_len);
+        OPENSSL_free(client_data);
+        TRUST_TOKEN_free(rtoken);
+        return ok;
+      })) {
+    fprintf(stderr, "TRUST_TOKEN_ISSUER_redeem failed.\n");
+    return false;
+  }
+  results.Print(name + " redeem");
+
+  uint32_t public_value;
+  uint8_t private_value;
+  TRUST_TOKEN *rtoken;
+  uint8_t *client_data = NULL;
+  size_t client_data_len;
+  if (!TRUST_TOKEN_ISSUER_redeem(issuer.get(), &public_value, &private_value,
+                                 &rtoken, &client_data, &client_data_len,
+                                 redeem_msg, redeem_msg_len)) {
+    fprintf(stderr, "TRUST_TOKEN_ISSUER_redeem failed.\n");
+    return false;
+  }
+  bssl::UniquePtr<uint8_t> free_client_data(client_data);
+  bssl::UniquePtr<TRUST_TOKEN> free_rtoken(rtoken);
+
+  return true;
+}
+
+#if defined(BORINGSSL_FIPS)
+static bool SpeedSelfTest(const std::string &selected) {
+  if (!selected.empty() && selected.find("self-test") == std::string::npos) {
+    return true;
+  }
+
+  TimeResults results;
+  if (!TimeFunction(&results, []() -> bool { return BORINGSSL_self_test(); })) {
+    fprintf(stderr, "BORINGSSL_self_test faileid.\n");
+    ERR_print_errors_fp(stderr);
+    return false;
+  }
+
+  results.Print("self-test");
+  return true;
+}
+#endif
 
 static const struct argument kArguments[] = {
     {
@@ -849,6 +1374,16 @@ static const struct argument kArguments[] = {
         "16,256,1350,8192,16384)",
     },
     {
+        "-json",
+        kBooleanArgument,
+        "If this flag is set, speed will print the output of each benchmark in "
+        "JSON format as follows: \"{\"description\": "
+        "\"descriptionOfOperation\", \"numCalls\": 1234, "
+        "\"timeInMicroseconds\": 1234567, \"bytesPerCall\": 1234}\". When "
+        "there is no information about the bytes per call for an  operation, "
+        "the JSON field for bytesPerCall will be omitted.",
+    },
+    {
         "",
         kOptionalArgument,
         "",
@@ -865,6 +1400,10 @@ bool Speed(const std::vector<std::string> &args) {
   std::string selected;
   if (args_map.count("-filter") != 0) {
     selected = args_map["-filter"];
+  }
+
+  if (args_map.count("-json") != 0) {
+    g_print_json = true;
   }
 
   if (args_map.count("-timeout") != 0) {
@@ -906,6 +1445,9 @@ bool Speed(const std::vector<std::string> &args) {
   // knowledge in them and construct a couple of the AD bytes internally.
   static const size_t kLegacyADLen = kTLSADLen - 2;
 
+  if (g_print_json) {
+    puts("[");
+  }
   if (!SpeedRSA(selected) ||
       !SpeedAEAD(EVP_aead_aes_128_gcm(), "AES-128-GCM", kTLSADLen, selected) ||
       !SpeedAEAD(EVP_aead_aes_256_gcm(), "AES-256-GCM", kTLSADLen, selected) ||
@@ -931,9 +1473,12 @@ bool Speed(const std::vector<std::string> &args) {
                      selected) ||
       !SpeedAEAD(EVP_aead_aes_128_ccm_bluetooth(), "AES-128-CCM-Bluetooth",
                  kTLSADLen, selected) ||
+      !SpeedAESBlock("AES-128", 128, selected) ||
+      !SpeedAESBlock("AES-256", 256, selected) ||
       !SpeedHash(EVP_sha1(), "SHA-1", selected) ||
       !SpeedHash(EVP_sha256(), "SHA-256", selected) ||
       !SpeedHash(EVP_sha512(), "SHA-512", selected) ||
+      !SpeedHash(EVP_blake2b256(), "BLAKE2b-256", selected) ||
       !SpeedRandom(selected) ||
       !SpeedECDH(selected) ||
       !SpeedECDSA(selected) ||
@@ -941,8 +1486,32 @@ bool Speed(const std::vector<std::string> &args) {
       !SpeedSPAKE2(selected) ||
       !SpeedScrypt(selected) ||
       !SpeedRSAKeyGen(selected) ||
-      !SpeedHRSS(selected)) {
+      !SpeedHRSS(selected) ||
+      !SpeedKyber(selected) ||
+      !SpeedHashToCurve(selected) ||
+      !SpeedTrustToken("TrustToken-Exp1-Batch1", TRUST_TOKEN_experiment_v1(), 1,
+                       selected) ||
+      !SpeedTrustToken("TrustToken-Exp1-Batch10", TRUST_TOKEN_experiment_v1(),
+                       10, selected) ||
+      !SpeedTrustToken("TrustToken-Exp2VOPRF-Batch1",
+                       TRUST_TOKEN_experiment_v2_voprf(), 1, selected) ||
+      !SpeedTrustToken("TrustToken-Exp2VOPRF-Batch10",
+                       TRUST_TOKEN_experiment_v2_voprf(), 10, selected) ||
+      !SpeedTrustToken("TrustToken-Exp2PMB-Batch1",
+                       TRUST_TOKEN_experiment_v2_pmb(), 1, selected) ||
+      !SpeedTrustToken("TrustToken-Exp2PMB-Batch10",
+                       TRUST_TOKEN_experiment_v2_pmb(), 10, selected) ||
+      !SpeedBase64(selected) ||
+      !SpeedSipHash(selected)) {
     return false;
+  }
+#if defined(BORINGSSL_FIPS)
+  if (!SpeedSelfTest(selected)) {
+    return false;
+  }
+#endif
+  if (g_print_json) {
+    puts("\n]");
   }
 
   return true;

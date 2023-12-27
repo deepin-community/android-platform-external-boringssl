@@ -1,4 +1,5 @@
 #!/usr/bin/dh-exec
 
-debian/out/*.so   usr/lib/${DEB_HOST_MULTIARCH}/android
-include/openssl   usr/include/android
+src/include/openssl			usr/include/android
+debian/out/libcrypto.so		usr/lib/${DEB_HOST_MULTIARCH}/android
+debian/out/libssl.so		usr/lib/${DEB_HOST_MULTIARCH}/android

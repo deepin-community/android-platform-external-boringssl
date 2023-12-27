@@ -1,0 +1,12 @@
+Procedure to update to a new upstream release:
+# Depends: golang-go
+
+$ debian/rules update
+
+# Update to preview or beta version from upstream branch/tag
+# Download orig tgz from site: https://android.googlesource.com/platform/external/boringssl/+/refs/tags/android-u-beta-1-gpl
+# Rename to ../android-platform-external-boringssl_14~beta1.tar.gz
+
+$ IMPORT_VER=14~beta1 debian/rules update
+
+ -- Roger Shimizu <rosh@debian.org>  Sat, 29 Jul 2023 20:01:05 -0700

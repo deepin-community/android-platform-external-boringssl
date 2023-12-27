@@ -1,9 +1,302 @@
-android-platform-external-boringssl (10.0.0+r36-2) unstable; urgency=medium
+android-platform-external-boringssl (14.0.0+r11-4) unstable; urgency=medium
 
-  [ Dhyey Patel ]
-  * UNRELEASED
+  * debian/control: Remove android-boringssl package for hurd-*.
 
- -- Deepin Packages Builder <packages@deepin.org>  Wed, 21 Dec 2022 15:13:25 +0800
+ -- Roger Shimizu <rosh@debian.org>  Sun, 12 Nov 2023 01:07:44 -0800
+
+android-platform-external-boringssl (14.0.0+r11-3) unstable; urgency=medium
+
+  * debian/watch: Keep upstream version same as upstream's one
+  * Add alpha arc hurd-amd64 loong64 - all little endian systems.
+  * Revert "d/include: Add chrono header from libstdc++-13-dev to fix ftbfs
+    for gcc-13".
+
+ -- Roger Shimizu <rosh@debian.org>  Sat, 11 Nov 2023 16:39:51 -0800
+
+android-platform-external-boringssl (14.0.0+r11-2) unstable; urgency=medium
+
+  * debian/rules: Skip building compiler_test for hurd-i386.
+
+ -- Roger Shimizu <rosh@debian.org>  Thu, 09 Nov 2023 20:38:45 -0800
+
+android-platform-external-boringssl (14.0.0+r11-1) unstable; urgency=medium
+
+  * Upload to unstable.
+
+ -- Roger Shimizu <rosh@debian.org>  Tue, 07 Nov 2023 00:20:55 -0800
+
+android-platform-external-boringssl (14.0.0+r11-1~exp1) experimental; urgency=medium
+
+  * New upstream release 14.0.0+r11
+  * debian/sources.mk: Update by script.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 05 Nov 2023 21:06:33 -0800
+
+android-platform-external-boringssl (14~beta1-1~exp2) experimental; urgency=medium
+
+  * debian/patches: Add patch to revert remove support for ppc64le.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 30 Jul 2023 02:48:52 -0700
+
+android-platform-external-boringssl (14~beta1-1~exp1) experimental; urgency=medium
+
+  * New upstream release 14~beta1
+  * debian/patches: Refresh patches.
+  * debian/compiler_test.mk: Update for new upstream version.
+  * debian/*.mk: Move c&cpp std version to d/rules.
+  * debian/*_test.mk: Remove no need android lib rpath.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 30 Jul 2023 00:02:10 -0700
+
+android-platform-external-boringssl (13.0.0+r24-3) unstable; urgency=medium
+
+  * Add debian/README.packaging
+  * debian/include:
+    - Add chrono header from libstdc++-13-dev to fix ftbfs for gcc-13
+      (Closes: #1037575).
+
+ -- Roger Shimizu <rosh@debian.org>  Sat, 22 Jul 2023 20:58:12 -0700
+
+android-platform-external-boringssl (13.0.0+r24-2) unstable; urgency=medium
+
+  * debian/patches: Refresh again.
+  * debian/rules: Add script to import new upstream.
+  * debian/lintian-overrides: Add mips*el specific tag.
+
+ -- Roger Shimizu <rosh@debian.org>  Tue, 17 Jan 2023 21:08:43 -0800
+
+android-platform-external-boringssl (13.0.0+r24-1) unstable; urgency=medium
+
+  [ Debian Janitor ]
+  * Use correct machine-readable copyright file URI.
+  * Bump debhelper from old 12 to 13.
+  * Update standards version to 4.6.1, no changes needed.
+
+  [ Roger Shimizu ]
+  * New upstream release 13.0.0+r24
+  * debian/*.lintian-overrides: Update to make more accurate.
+  * debian/copyright:
+    - Remove non-existing entries.
+    - Fix typo.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 16 Jan 2023 02:04:16 -0800
+
+android-platform-external-boringssl (13.0.0+r11-3) unstable; urgency=medium
+
+  * Team upload.
+  * Add patch to skip failing test (Closes: #1026716)
+  * Move package description to source package
+
+ -- Jochen Sprickerhof <jspricke@debian.org>  Tue, 27 Dec 2022 22:11:29 +0100
+
+android-platform-external-boringssl (13.0.0+r11-2) unstable; urgency=medium
+
+  * debian/rules: Export gdwarf-4 so we align with ubuntu patches.
+
+ -- Roger Shimizu <rosh@debian.org>  Tue, 15 Nov 2022 22:28:07 -0800
+
+android-platform-external-boringssl (13.0.0+r11-1) unstable; urgency=medium
+
+  * New upstream release 13.0.0+r11
+  * debian/patches: Remove backport patch.
+  * debian/copyright: Update file list.
+  * debian/sources.mk: Update by script.
+  * debian/control: Add myself as uploader.
+
+ -- Roger Shimizu <rosh@debian.org>  Sat, 29 Oct 2022 01:58:01 -0700
+
+android-platform-external-boringssl (13~preview2-7) unstable; urgency=medium
+
+  * Team upload.
+  * [again] Use lld as linker on available platforms.
+
+ -- Roger Shimizu <rosh@debian.org>  Tue, 28 Jun 2022 02:04:55 +0900
+
+android-platform-external-boringssl (13~preview2-6) unstable; urgency=medium
+
+  * Team upload.
+  * Use lld as linker on available platforms.
+  * debian/patches/0[12]: Add patch description.
+  * d/source/lintian-overrides: Adapt new rule to source filename.
+  * Add debian/upstream/metadata.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 27 Jun 2022 19:38:58 +0900
+
+android-platform-external-boringssl (13~preview2-5) unstable; urgency=medium
+
+  * Team upload.
+  * debian/*.mk: Fix ftbfs for mips*el.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 19 Jun 2022 02:14:20 +0900
+
+android-platform-external-boringssl (13~preview2-4) unstable; urgency=medium
+
+  * Team upload.
+  * Add patch from upstream tag platform-tools-33.0.1.
+  * Move -pie from debian/rules to debian/*.mk executable build.
+  * [ubuntu] debian/rules: ignore dh_dwz error.
+  * Use lld as linker when available.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 19 Jun 2022 00:21:10 +0900
+
+android-platform-external-boringssl (13~preview2-3) unstable; urgency=medium
+
+  * Team upload.
+  * d/rules: Move common CPPFLAGS from d/*.mk to d/rules
+  * d/control: Move android-libboringssl-dev from Architecture: all to
+    each arch being supported.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 13 Jun 2022 00:52:06 +0900
+
+android-platform-external-boringssl (13~preview2-2) unstable; urgency=medium
+
+  * Team upload.
+  * debian/*.mk: Fix ftbfs for armel.
+
+ -- Roger Shimizu <rosh@debian.org>  Tue, 07 Jun 2022 18:35:21 +0900
+
+android-platform-external-boringssl (13~preview2-1) unstable; urgency=medium
+
+  * Team upload.
+  * debian/*.mk: Using the "gnu11" variant means we don't need _XOPEN_SOURCE.
+    Additionally, using C11 makes the faster refcount implementation
+    available. This setting is from upstream.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 06 Jun 2022 21:09:55 +0900
+
+android-platform-external-boringssl (13~preview2-1~exp1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream version 13~preview2
+  * debian/patches: Refresh patches.
+  * debian/sources.mk: Update by script.
+
+ -- Roger Shimizu <rosh@debian.org>  Wed, 01 Jun 2022 04:00:31 +0900
+
+android-platform-external-boringssl (12.1.0+r5-2) unstable; urgency=medium
+
+  * Team upload.
+  * debian/tests/control: Limit architecture.
+
+ -- Roger Shimizu <rosh@debian.org>  Tue, 31 May 2022 01:41:52 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1) unstable; urgency=medium
+
+  * Team upload.
+  * Upload to unstable.
+  * debian/rules: Build and test only for -arch build.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 30 May 2022 19:06:02 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp10) experimental; urgency=medium
+
+  * Team upload.
+  * debian/crypto_test.mk: Fallback to gcc for mips64el.
+    Thanks to Adrian Bunk for fixing this test for mips64el.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 29 May 2022 16:50:06 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp9) experimental; urgency=medium
+
+  * Team upload.
+  * debian/control: Update Depends version.
+  * debian/tests/control: Add autopkgtest test.
+
+ -- Roger Shimizu <rosh@debian.org>  Sat, 28 May 2022 18:38:29 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp8) experimental; urgency=medium
+
+  * Team upload.
+  * debian/rules:
+    - Disable building bssl-tools for Hurd.
+    - Add -pie to LDFLAGS to enhance the hardening.
+  * debian/control:
+    - Add android-boringssl package to include the tool.
+  * debian/copyright & debian/source/lintian-overrides:
+    - Adapt with new upstream.
+
+ -- Roger Shimizu <rosh@debian.org>  Thu, 26 May 2022 01:00:02 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp7) experimental; urgency=medium
+
+  * Team upload.
+  * debian/tool_test.mk and debian/rules:
+    - Add bssl-tool to build.
+  * debian/rules:
+    - Still run failing test for mips64el, just ignore the result.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 23 May 2022 21:01:59 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp6) experimental; urgency=medium
+
+  * Team upload.
+  * Disable crypto_test for mips64el temporarily.
+  * Split test_support as an independant library.
+  * d/rules:
+    - Make dependency driven makefile rules.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 16 May 2022 23:23:41 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp5) experimental; urgency=medium
+
+  * Team upload.
+  * Update eureka.mk and source it in debian/*.mk
+  * d/{crypto,ssl}_test.mk:
+    - Link with atomic for armel.
+  * d/patches:
+    - Update 01 patch to fix x32.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 16 May 2022 02:25:59 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp4) experimental; urgency=medium
+
+  * Team upload.
+  * debian/patches:
+    - Update patch to fix sh4 and x32.
+  * Add debian/{crypto,ssl}_test.mk to test built libraries.
+  * d/lib{crypto,ssl}.mk:
+    - Import source list from eureka.mk.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 15 May 2022 19:24:19 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp3) experimental; urgency=medium
+
+  * Team upload.
+  * debian/control: Add all little endian Arch, to check the buildd
+    result.
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 15 May 2022 03:27:01 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp2) experimental; urgency=medium
+
+  * Team upload.
+  * Try to build on new Arch (little endian): ia64, riscv64, sh4, x32
+
+ -- Roger Shimizu <rosh@debian.org>  Sun, 15 May 2022 01:59:06 +0900
+
+android-platform-external-boringssl (12.1.0+r5-1~exp1) experimental; urgency=medium
+
+  * New upstream version 12.1.0+r5
+  * debian/control:
+    - Fix multiarch issues.
+    - Add ppc64el support.
+  * debian/rules:
+    - Use clang as default compiler.
+
+ -- Roger Shimizu <rosh@debian.org>  Sat, 14 May 2022 02:09:14 +0900
+
+android-platform-external-boringssl (10.0.0+r36-2~exp1) experimental; urgency=medium
+
+  * Team upload.
+
+  [ Hans-Christoph Steiner ]
+  * gitlab-ci: exclude tags, pristine-tar, upstream
+
+  [ Roger Shimizu ]
+  * debian/control:
+    - Add mips*el to build.
+
+ -- Roger Shimizu <rosh@debian.org>  Mon, 11 Jan 2021 03:31:07 +0900
 
 android-platform-external-boringssl (10.0.0+r36-1) unstable; urgency=medium
 

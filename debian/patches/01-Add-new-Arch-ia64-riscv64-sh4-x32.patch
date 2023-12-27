@@ -1,0 +1,27 @@
+Description: Support to build on little endian systems: ia64, riscv64, sh4, and x32
+Forwarded: https://boringssl-review.googlesource.com/c/boringssl/+/52965
+--- a/src/include/openssl/base.h
++++ b/src/include/openssl/base.h
+@@ -84,7 +84,7 @@ extern "C" {
+ #endif
+ 
+ 
+-#if defined(__x86_64) || defined(_M_AMD64) || defined(_M_X64)
++#if (defined(__x86_64) && defined(__LP64__)) || defined(_M_AMD64) || defined(_M_X64)
+ #define OPENSSL_64_BIT
+ #define OPENSSL_X86_64
+ #elif defined(__x86) || defined(__i386) || defined(__i386__) || defined(_M_IX86)
+@@ -109,6 +109,13 @@ extern "C" {
+ #define OPENSSL_RISCV64
+ #elif defined(__riscv) && __SIZEOF_POINTER__ == 4
+ #define OPENSSL_32_BIT
++#elif defined(__ia64__)
++#define OPENSSL_64_BIT
++#elif defined(__x86_64__) && defined(__ILP32__) // x32
++#define OPENSSL_32_BIT
++#define OPENSSL_X86_64
++#elif defined(__sh__)
++#define OPENSSL_32_BIT
+ #elif defined(__pnacl__)
+ #define OPENSSL_32_BIT
+ #define OPENSSL_PNACL

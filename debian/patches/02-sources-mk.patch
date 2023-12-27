@@ -1,0 +1,14 @@
+Description: Update debian/sources.mk
+Forwarded: not-needed
+--- a/src/util/generate_build_files.py
++++ b/src/util/generate_build_files.py
+@@ -315,6 +315,9 @@ class Eureka(object):
+       self.PrintVariableSection(makefile, 'crypto_sources', files['crypto'])
+       self.PrintVariableSection(makefile, 'ssl_sources', files['ssl'])
+       self.PrintVariableSection(makefile, 'tool_sources', files['tool'])
++      self.PrintVariableSection(makefile, 'test_support_sources', files['test_support'])
++      self.PrintVariableSection(makefile, 'crypto_test_sources', files['crypto_test'])
++      self.PrintVariableSection(makefile, 'ssl_test_sources', files['ssl_test'])
+ 
+       for ((osname, arch), asm_files) in asm_outputs:
+         if osname != 'linux':

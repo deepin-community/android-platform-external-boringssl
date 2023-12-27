@@ -3,11 +3,106 @@
 include /usr/share/dpkg/architecture.mk
 include /usr/share/dpkg/pkg-info.mk
 
+## Security Hardening
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all optimize=-lto
+export DEB_CFLAGS_MAINT_APPEND = -fPIC -std=gnu17
+export DEB_CXXFLAGS_MAINT_APPEND = -fPIC -std=gnu++2a
 export DEB_LDFLAGS_MAINT_APPEND = -fPIC
-export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_CPPFLAGS_MAINT_APPEND = -DNDEBUG -UDEBUG \
+  -DBORINGSSL_ANDROID_SYSTEM \
+  -DBORINGSSL_IMPLEMENTATION \
+  -DBORINGSSL_SHARED_LIBRARY \
+  -DOPENSSL_SMALL \
+  -fmessage-length=0 \
+  -fno-exceptions \
+  -fno-strict-aliasing \
+  -no-canonical-prefixes \
+
+ifneq (, $(shell which clang))
+  export CC = clang
+  export CXX = clang++
+  export DEB_CFLAGS_MAINT_APPEND += -gdwarf-4
+  export DEB_CXXFLAGS_MAINT_APPEND += -gdwarf-4
+endif
+ifneq (, $(shell which lld))
+  export DEB_LDFLAGS_MAINT_APPEND += -fuse-ld=lld -Wl,--build-id=sha1
+endif
+
+ifeq ($(IMPORT_VER),)
+	GBP_IMPORT = --uscan
+else ifneq ("$(wildcard ../$(DEB_SOURCE)_$(IMPORT_VER).tar.gz)","")
+	GBP_IMPORT = ../$(DEB_SOURCE)_$(IMPORT_VER).tar.gz
+else
+	GBP_IMPORT =
+endif
 
 %:
 	dh $@
-override_dh_auto_build:
-	dh_auto_build --buildsystem=makefile -- -f debian/libcrypto.mk
-	dh_auto_build --buildsystem=makefile -- -f debian/libssl.mk
+
+lib%.so: debian/lib%.mk
+	dh_auto_build --buildsystem=makefile -- --file=$<
+
+compiler_test: debian/compiler_test.mk
+	dh_auto_build --buildsystem=makefile -- --file=$<
+	debian/out/test/$@
+
+%_test: debian/%_test.mk libtest_support.so libcrypto.so libssl.so
+	dh_auto_build --buildsystem=makefile -- --file=$<
+
+ifeq ($(filter hurd-amd64 hurd-i386,$(DEB_HOST_ARCH)),)
+override_dh_auto_build-arch: compiler_test tool_test
+else
+# TODO: compiler_test, tool_test build fails on hurd-* currently
+override_dh_auto_build-arch:
+endif
+	dh_auto_build
+
+ifeq (,$(findstring nocheck, $(DEB_BUILD_OPTIONS)))
+override_dh_auto_test-arch: crypto_test ssl_test
+ifeq ($(filter hurd-amd64 hurd-i386,$(DEB_HOST_ARCH)),)
+	LD_LIBRARY_PATH=debian/out debian/out/bssl-tool genrsa
+endif
+	LD_LIBRARY_PATH=debian/out debian/out/crypto_test
+	LD_LIBRARY_PATH=debian/out debian/out/ssl_test
+endif
+
+override_dh_dwz:
+	dh_dwz || true
+
+# Since this depends on golang-go, not gccgo, so let's update manually
+# Depends: golang-go
+update-sources-mk:
+	dpkg-source --before-build .
+	python3 src/util/generate_build_files.py eureka
+	cp eureka.mk debian/sources.mk
+get-orig-source:
+	gbp import-orig $(GBP_IMPORT) \
+		--no-interactive --debian-branch=$(shell git symbolic-ref --short HEAD) \
+		--postimport="\
+		dch -b -v\$$GBP_DEBIAN_VERSION \"New upstream release \$$GBP_UPSTREAM_VERSION\"; \
+		git add debian/changelog; \
+		git commit -m\"dch: Note new upstream version \$$GBP_UPSTREAM_VERSION\""
+check-upstream:
+	$(eval count = $$(shell git show upstream|wc -l))
+	@test $(count) -gt 10 || ( \
+		git reset --hard HEAD^^; \
+		git tag -d upstream/$(shell echo $(DEB_VERSION_UPSTREAM)|sed "s/~/_/g;s/:/%/g"); \
+		git checkout upstream; git reset --hard HEAD^; git checkout $(shell git symbolic-ref --short HEAD); \
+		echo; \
+		echo error: Line count of upstream/$(DEB_VERSION_UPSTREAM): $(count); \
+		echo Upstream changes does not deserve an update.;\
+		echo; \
+		exit 1; \
+	)
+ifeq ($(GBP_IMPORT),)
+update:
+	@echo Cannot find orig to import: ../$(DEB_SOURCE)_$(IMPORT_VER).tar.gz
+else
+update: get-orig-source check-upstream update-sources-mk
+	git diff --quiet debian/sources.mk || \
+		(dch -a "debian/sources.mk: Update by script."; \
+		git add debian/sources.mk debian/changelog; \
+		git commit --amend -m "d/sources.mk: Update by script")
+	git clean -fdx; git reset --hard
+	@echo Package updated to upstream version: $(shell dpkg-parsechangelog -SVersion|sed 's/-[^-]*$$//'|sed 's/^[0-9]*://')
+endif

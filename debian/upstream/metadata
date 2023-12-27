@@ -1,0 +1,6 @@
+Archive: Android Open Source Project (AOSP)
+Bug-Database: https://bugs.chromium.org/p/boringssl/issues/list
+Bug-Submit: https://bugs.chromium.org/p/boringssl/issues/entry
+Documentation: https://boringssl.googlesource.com/boringssl
+Repository-Browse: https://android.googlesource.com/platform/external/boringssl
+Security-Contact: https://source.android.com/security/overview/updates-resources#report-issues
