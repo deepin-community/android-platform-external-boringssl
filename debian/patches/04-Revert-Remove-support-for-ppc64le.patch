@@ -1,0 +1,2647 @@
+Description: Revert "Remove support for ppc64le."
+ This reverts commit 7d2338d000eb1468a5bbf78e91854236e18fb9e4.
+ This reverts commit cbccae538c6f03cdf7b9fa263fd1c37724d7a769.
+Forwarded: not-needed
+--- a/src/crypto/fipsmodule/rand/getrandom_fillin.h
++++ b/src/crypto/fipsmodule/rand/getrandom_fillin.h
+@@ -30,6 +30,8 @@
+ #define EXPECTED_NR_getrandom 278
+ #elif defined(OPENSSL_ARM)
+ #define EXPECTED_NR_getrandom 384
++#elif defined(OPENSSL_PPC64LE)
++#define EXPECTED_NR_getrandom 359
+ #elif defined(OPENSSL_RISCV64)
+ #define EXPECTED_NR_getrandom 278
+ #endif
+--- a/src/include/openssl/base.h
++++ b/src/include/openssl/base.h
+@@ -96,6 +96,9 @@ extern "C" {
+ #elif defined(__ARMEL__) || defined(_M_ARM)
+ #define OPENSSL_32_BIT
+ #define OPENSSL_ARM
++#elif (defined(__PPC64__) || defined(__powerpc64__)) && defined(_LITTLE_ENDIAN)
++#define OPENSSL_64_BIT
++#define OPENSSL_PPC64LE
+ #elif defined(__MIPSEL__) && !defined(__LP64__)
+ #define OPENSSL_32_BIT
+ #define OPENSSL_MIPS
+--- a/src/util/fipstools/acvp/modulewrapper/main.cc
++++ b/src/util/fipstools/acvp/modulewrapper/main.cc
+@@ -33,6 +33,8 @@ int main(int argc, char **argv) {
+     puts("ARM (32-bit)");
+ #elif defined(OPENSSL_AARCH64)
+     puts("aarch64 (64-bit)");
++#elif defined(OPENSSL_PPC64LE)
++    puts("PPC64LE (64-bit)");
+ #else
+ #error "FIPS build not supported on this architecture"
+ #endif
+--- a/src/util/fipstools/delocate/delocate.go
++++ b/src/util/fipstools/delocate/delocate.go
+@@ -54,7 +54,8 @@ type stringWriter interface {
+ type processorType int
+ 
+ const (
+-	x86_64 processorType = iota + 1
++	ppc64le processorType = iota + 1
++	x86_64
+ 	aarch64
+ )
+ 
+@@ -67,6 +68,8 @@ type delocation struct {
+ 
+ 	// symbols is the set of symbols defined in the module.
+ 	symbols map[string]struct{}
++	// localEntrySymbols is the set of symbols with .localentry directives.
++	localEntrySymbols map[string]struct{}
+ 	// redirectors maps from out-call symbol name to the name of a
+ 	// redirector function for that symbol. E.g. “memcpy” ->
+ 	// “bcm_redirector_memcpy”.
+@@ -75,6 +78,9 @@ type delocation struct {
+ 	// should be used to reference it. E.g. “P384_data_storage” ->
+ 	// “P384_data_storage”.
+ 	bssAccessorsNeeded map[string]string
++	// tocLoaders is a set of symbol names for which TOC helper functions
++	// are required. (ppc64le only.)
++	tocLoaders map[string]struct{}
+ 	// gotExternalsNeeded is a set of symbol names for which we need
+ 	// “delta” symbols: symbols that contain the offset from their location
+ 	// to the memory in question.
+@@ -151,6 +157,8 @@ func (d *delocation) processInput(input inputFile) (err error) {
+ 			switch d.processor {
+ 			case x86_64:
+ 				statement, err = d.processIntelInstruction(statement, node.up)
++			case ppc64le:
++				statement, err = d.processPPCInstruction(statement, node.up)
+ 			case aarch64:
+ 				statement, err = d.processAarch64Instruction(statement, node.up)
+ 			default:
+@@ -247,7 +255,7 @@ func (d *delocation) processDirective(statement, directive *node32) (*node32, er
+ 			d.writeNode(statement)
+ 			break
+ 
+-		case ".debug", ".note":
++		case ".debug", ".note", ".toc":
+ 			d.writeNode(statement)
+ 			break
+ 
+@@ -307,6 +315,10 @@ func (d *delocation) processLabelContainingDirective(statement, directive *node3
+ 		d.output.WriteString("\t" + name + "\t" + strings.Join(args, ", ") + "\n")
+ 	}
+ 
++	if name == ".localentry" {
++		d.output.WriteString(localEntryName(args[0]) + ":\n")
++	}
++
+ 	return statement, nil
+ }
+ 
+@@ -617,6 +629,191 @@ func (d *delocation) processAarch64Instruction(statement, instruction *node32) (
+ 	return statement, nil
+ }
+ 
++/* ppc64le
++
++[PABI]: “64-Bit ELF V2 ABI Specification. Power Architecture.” March 21st,
++        2017
++
++(Also useful is “Power ISA Version 2.07 B”. Note that version three of that
++document is /not/ good as that's POWER9 specific.)
++
++ppc64le doesn't have IP-relative addressing and does a lot to work around this.
++Rather than reference a PLT and GOT direction, it has a single structure called
++the TOC (Table Of Contents). Within the TOC is the contents of .rodata, .data,
++.got, .plt, .bss, etc sections [PABI;3.3].
++
++A pointer to the TOC is maintained in r2 and the following pattern is used to
++load the address of an element into a register:
++
++  addis <address register>, 2, foo@toc@ha
++  addi <address register>, <address register>, foo@toc@l
++
++The “addis” instruction shifts a signed constant left 16 bits and adds the
++result to its second argument, saving the result in the first argument. The
++“addi” instruction does the same, but without shifting. Thus the “@toc@ha"
++suffix on a symbol means “the top 16 bits of the TOC offset” and “@toc@l” means
++“the bottom 16 bits of the offset”. However, note that both values are signed,
++thus offsets in the top half of a 64KB chunk will have an @ha value that's one
++greater than expected and a negative @l value.
++
++The TOC is specific to a “module” (basically an executable or shared object).
++This means that there's not a single TOC in a process and that r2 needs to
++change as control moves between modules. Thus functions have two entry points:
++the “global” entry point and the “local” entry point. Jumps from within the
++same module can use the local entry while jumps from other modules must use the
++global entry. The global entry establishes the correct value of r2 before
++running the function and the local entry skips that code.
++
++The global entry point for a function is defined by its label. The local entry
++is a power-of-two number of bytes from the global entry, set by the
++“.localentry” directive. (ppc64le instructions are always 32 bits, so an offset
++of 1 or 2 bytes is treated as an offset of zero.)
++
++In order to help the global entry code set r2 to point to the local TOC, r12 is
++set to the address of the global entry point when called [PABI;2.2.1.1]. Thus
++the global entry will typically use an addis+addi pair to add a known offset to
++r12 and store it in r2. For example:
++
++foo:
++  addis 2, 12, .TOC. - foo@ha
++  addi  2, 2,  .TOC. - foo@l
++
++(It's worth noting that the '@' operator binds very loosely, so the 3rd
++arguments parse as (.TOC. - foo)@ha and (.TOC. - foo)@l.)
++
++When calling a function, the compiler doesn't know whether that function is in
++the same module or not. Thus it doesn't know whether r12 needs to be set nor
++whether r2 will be clobbered on return. Rather than always assume the worst,
++the linker fixes stuff up once it knows that a call is going out of module:
++
++Firstly, calling, say, memcpy (which we assume to be in a different module)
++won't actually jump directly to memcpy, or even a PLT resolution function.
++It'll call a synthesised function that:
++  a) saves r2 in the caller's stack frame
++  b) loads the address of memcpy@PLT into r12
++  c) jumps to r12.
++
++As this synthesised function loads memcpy@PLT, a call to memcpy from the
++compiled code just references “memcpy” directly, not “memcpy@PLT”.
++
++Since it jumps directly to memcpy@PLT, it can't restore r2 on return. Thus
++calls must be followed by a nop. If the call ends up going out-of-module, the
++linker will rewrite that nop to load r2 from the stack.
++
++Speaking of the stack, the stack pointer is kept in r1 and there's a 288-byte
++red-zone. The format of the stack frame is defined [PABI;2.2.2] and must be
++followed as called functions will write into their parent's stack frame. For
++example, the synthesised out-of-module trampolines will save r2 24 bytes into
++the caller's frame and all non-leaf functions save the return address 16 bytes
++into the caller's frame.
++
++A final point worth noting: some RISC ISAs have r0 wired to zero: all reads
++result in zero and all writes are discarded. POWER does something a little like
++that, but r0 is only special in certain argument positions for certain
++instructions. You just have to read the manual to know which they are.
++
++
++Delocation is easier than Intel because there's just TOC references, but it's
++also harder because there's no IP-relative addressing.
++
++Jumps are IP-relative however, and have a 24-bit immediate value. So we can
++jump to functions that set a register to the needed value. (r3 is the
++return-value register and so that's what is generally used here.) */
++
++// isPPC64LEAPair recognises an addis+addi pair that's adding the offset of
++// source to relative and writing the result to target.
++func (d *delocation) isPPC64LEAPair(statement *node32) (target, source, relative string, ok bool) {
++	instruction := skipWS(statement.up).up
++	assertNodeType(instruction, ruleInstructionName)
++	name1 := d.contents(instruction)
++	args1 := instructionArgs(instruction.next)
++
++	statement = statement.next
++	instruction = skipWS(statement.up).up
++	assertNodeType(instruction, ruleInstructionName)
++	name2 := d.contents(instruction)
++	args2 := instructionArgs(instruction.next)
++
++	if name1 != "addis" ||
++		len(args1) != 3 ||
++		name2 != "addi" ||
++		len(args2) != 3 {
++		return "", "", "", false
++	}
++
++	target = d.contents(args1[0])
++	relative = d.contents(args1[1])
++	source1 := d.contents(args1[2])
++	source2 := d.contents(args2[2])
++
++	if !strings.HasSuffix(source1, "@ha") ||
++		!strings.HasSuffix(source2, "@l") ||
++		source1[:len(source1)-3] != source2[:len(source2)-2] ||
++		d.contents(args2[0]) != target ||
++		d.contents(args2[1]) != target {
++		return "", "", "", false
++	}
++
++	source = source1[:len(source1)-3]
++	ok = true
++	return
++}
++
++// establishTOC writes the global entry prelude for a function. The standard
++// prelude involves relocations so this version moves the relocation outside
++// the integrity-checked area.
++func establishTOC(w stringWriter) {
++	w.WriteString("999:\n")
++	w.WriteString("\taddis 2, 12, .LBORINGSSL_external_toc-999b@ha\n")
++	w.WriteString("\taddi 2, 2, .LBORINGSSL_external_toc-999b@l\n")
++	w.WriteString("\tld 12, 0(2)\n")
++	w.WriteString("\tadd 2, 2, 12\n")
++}
++
++// loadTOCFuncName returns the name of a synthesized function that sets r3 to
++// the value of “symbol+offset”.
++func loadTOCFuncName(symbol, offset string) string {
++	symbol = strings.Replace(symbol, ".", "_dot_", -1)
++	ret := ".Lbcm_loadtoc_" + symbol
++	if len(offset) != 0 {
++		offset = strings.Replace(offset, "+", "_plus_", -1)
++		offset = strings.Replace(offset, "-", "_minus_", -1)
++		ret += "_" + offset
++	}
++	return ret
++}
++
++func (d *delocation) loadFromTOC(w stringWriter, symbol, offset, dest string) wrapperFunc {
++	d.tocLoaders[symbol+"\x00"+offset] = struct{}{}
++
++	return func(k func()) {
++		w.WriteString("\taddi 1, 1, -288\n")   // Clear the red zone.
++		w.WriteString("\tmflr " + dest + "\n") // Stash the link register.
++		w.WriteString("\tstd " + dest + ", -8(1)\n")
++		// The TOC loader will use r3, so stash it if necessary.
++		if dest != "3" {
++			w.WriteString("\tstd 3, -16(1)\n")
++		}
++
++		// Because loadTOCFuncName returns a “.L” name, we don't need a
++		// nop after this call.
++		w.WriteString("\tbl " + loadTOCFuncName(symbol, offset) + "\n")
++
++		// Cycle registers around. We need r3 -> destReg, -8(1) ->
++		// lr and, optionally, -16(1) -> r3.
++		w.WriteString("\tstd 3, -24(1)\n")
++		w.WriteString("\tld 3, -8(1)\n")
++		w.WriteString("\tmtlr 3\n")
++		w.WriteString("\tld " + dest + ", -24(1)\n")
++		if dest != "3" {
++			w.WriteString("\tld 3, -16(1)\n")
++		}
++		w.WriteString("\taddi 1, 1, 288\n")
++
++		k()
++	}
++}
++
+ func (d *delocation) gatherOffsets(symRef *node32, offsets string) (*node32, string) {
+ 	for symRef != nil && symRef.pegRule == ruleOffset {
+ 		offset := d.contents(symRef)
+@@ -671,6 +868,215 @@ func (d *delocation) parseMemRef(memRef *node32) (symbol, offset, section string
+ 	return
+ }
+ 
++func (d *delocation) processPPCInstruction(statement, instruction *node32) (*node32, error) {
++	assertNodeType(instruction, ruleInstructionName)
++	instructionName := d.contents(instruction)
++	isBranch := instructionName[0] == 'b'
++
++	argNodes := instructionArgs(instruction.next)
++
++	var wrappers wrapperStack
++	var args []string
++	changed := false
++
++Args:
++	for i, arg := range argNodes {
++		fullArg := arg
++		isIndirect := false
++
++		if arg.pegRule == ruleIndirectionIndicator {
++			arg = arg.next
++			isIndirect = true
++		}
++
++		switch arg.pegRule {
++		case ruleRegisterOrConstant, ruleLocalLabelRef:
++			args = append(args, d.contents(fullArg))
++
++		case ruleTOCRefLow:
++			return nil, errors.New("Found low TOC reference outside preamble pattern")
++
++		case ruleTOCRefHigh:
++			target, _, relative, ok := d.isPPC64LEAPair(statement)
++			if !ok {
++				return nil, errors.New("Found high TOC reference outside preamble pattern")
++			}
++
++			if relative != "12" {
++				return nil, fmt.Errorf("preamble is relative to %q, not r12", relative)
++			}
++
++			if target != "2" {
++				return nil, fmt.Errorf("preamble is setting %q, not r2", target)
++			}
++
++			statement = statement.next
++			establishTOC(d.output)
++			instructionName = ""
++			changed = true
++			break Args
++
++		case ruleMemoryRef:
++			symbol, offset, section, didChange, symbolIsLocal, memRef := d.parseMemRef(arg.up)
++			changed = didChange
++
++			if len(symbol) > 0 {
++				if _, localEntrySymbol := d.localEntrySymbols[symbol]; localEntrySymbol && isBranch {
++					symbol = localEntryName(symbol)
++					changed = true
++				} else if _, knownSymbol := d.symbols[symbol]; knownSymbol {
++					symbol = localTargetName(symbol)
++					changed = true
++				} else if !symbolIsLocal && !isSynthesized(symbol) && len(section) == 0 {
++					changed = true
++					d.redirectors[symbol] = redirectorName(symbol)
++					symbol = redirectorName(symbol)
++					// TODO(davidben): This should sanity-check the next
++					// instruction is a nop and ideally remove it.
++					wrappers = append(wrappers, func(k func()) {
++						k()
++						// Like the linker's PLT stubs, redirector functions
++						// expect callers to restore r2.
++						d.output.WriteString("\tld 2, 24(1)\n")
++					})
++				}
++			}
++
++			switch section {
++			case "":
++
++			case "tls":
++				// This section identifier just tells the
++				// assembler to use r13, the pointer to the
++				// thread-local data [PABI;3.7.3.3].
++
++			case "toc@ha":
++				// Delete toc@ha instructions. Per
++				// [PABI;3.6.3], the linker is allowed to erase
++				// toc@ha instructions. We take advantage of
++				// this by unconditionally erasing the toc@ha
++				// instructions and doing the full lookup when
++				// processing toc@l.
++				//
++				// Note that any offset here applies before @ha
++				// and @l. That is, 42+foo@toc@ha is
++				// #ha(42+foo-.TOC.), not 42+#ha(foo-.TOC.). Any
++				// corresponding toc@l references are required
++				// by the ABI to have the same offset. The
++				// offset will be incorporated in full when
++				// those are processed.
++				if instructionName != "addis" || len(argNodes) != 3 || i != 2 || args[1] != "2" {
++					return nil, errors.New("can't process toc@ha reference")
++				}
++				changed = true
++				instructionName = ""
++				break Args
++
++			case "toc@l":
++				// Per [PAB;3.6.3], this instruction must take
++				// as input a register which was the output of
++				// a toc@ha computation and compute the actual
++				// address of some symbol. The toc@ha
++				// computation was elided, so we ignore that
++				// input register and compute the address
++				// directly.
++				changed = true
++
++				// For all supported toc@l instructions, the
++				// destination register is the first argument.
++				destReg := args[0]
++
++				wrappers = append(wrappers, d.loadFromTOC(d.output, symbol, offset, destReg))
++				switch instructionName {
++				case "addi":
++					// The original instruction was:
++					//   addi destReg, tocHaReg, offset+symbol@toc@l
++					instructionName = ""
++
++				case "ld", "lhz", "lwz":
++					// The original instruction was:
++					//   l?? destReg, offset+symbol@toc@l(tocHaReg)
++					//
++					// We transform that into the
++					// equivalent dereference of destReg:
++					//   l?? destReg, 0(destReg)
++					origInstructionName := instructionName
++					instructionName = ""
++
++					assertNodeType(memRef, ruleBaseIndexScale)
++					assertNodeType(memRef.up, ruleRegisterOrConstant)
++					if memRef.next != nil || memRef.up.next != nil {
++						return nil, errors.New("expected single register in BaseIndexScale for ld argument")
++					}
++
++					baseReg := destReg
++					if baseReg == "0" {
++						// Register zero is special as the base register for a load.
++						// Avoid it by spilling and using r3 instead.
++						baseReg = "3"
++						wrappers = append(wrappers, func(k func()) {
++							d.output.WriteString("\taddi 1, 1, -288\n") // Clear the red zone.
++							d.output.WriteString("\tstd " + baseReg + ", -8(1)\n")
++							d.output.WriteString("\tmr " + baseReg + ", " + destReg + "\n")
++							k()
++							d.output.WriteString("\tld " + baseReg + ", -8(1)\n")
++							d.output.WriteString("\taddi 1, 1, 288\n") // Clear the red zone.
++						})
++					}
++
++					wrappers = append(wrappers, func(k func()) {
++						d.output.WriteString("\t" + origInstructionName + " " + destReg + ", 0(" + baseReg + ")\n")
++					})
++				default:
++					return nil, fmt.Errorf("can't process TOC argument to %q", instructionName)
++				}
++
++			default:
++				return nil, fmt.Errorf("Unknown section type %q", section)
++			}
++
++			argStr := ""
++			if isIndirect {
++				argStr += "*"
++			}
++			argStr += symbol
++			if len(offset) > 0 {
++				argStr += offset
++			}
++			if len(section) > 0 {
++				argStr += "@"
++				argStr += section
++			}
++
++			for ; memRef != nil; memRef = memRef.next {
++				argStr += d.contents(memRef)
++			}
++
++			args = append(args, argStr)
++
++		default:
++			panic(fmt.Sprintf("unknown instruction argument type %q", rul3s[arg.pegRule]))
++		}
++	}
++
++	if changed {
++		d.writeCommentedNode(statement)
++
++		var replacement string
++		if len(instructionName) > 0 {
++			replacement = "\t" + instructionName + "\t" + strings.Join(args, ", ") + "\n"
++		}
++
++		wrappers.do(func() {
++			d.output.WriteString(replacement)
++		})
++	} else {
++		d.writeNode(statement)
++	}
++
++	return statement, nil
++}
++
+ /* Intel */
+ 
+ type instructionType int
+@@ -1268,6 +1674,8 @@ func writeAarch64Function(w stringWriter, funcName string, writeContents func(st
+ func transform(w stringWriter, inputs []inputFile) error {
+ 	// symbols contains all defined symbols.
+ 	symbols := make(map[string]struct{})
++	// localEntrySymbols contains all symbols with a .localentry directive.
++	localEntrySymbols := make(map[string]struct{})
+ 	// fileNumbers is the set of IDs seen in .file directives.
+ 	fileNumbers := make(map[int]struct{})
+ 	// maxObservedFileNumber contains the largest seen file number in a
+@@ -1290,6 +1698,25 @@ func transform(w stringWriter, inputs []inputFile) error {
+ 			symbols[symbol] = struct{}{}
+ 		}, ruleStatement, ruleLabel, ruleSymbolName)
+ 
++		forEachPath(input.ast.up, func(node *node32) {
++			node = node.up
++			assertNodeType(node, ruleLabelContainingDirectiveName)
++			directive := input.contents[node.begin:node.end]
++			if directive != ".localentry" {
++				return
++			}
++			// Extract the first argument.
++			node = skipWS(node.next)
++			assertNodeType(node, ruleSymbolArgs)
++			node = node.up
++			assertNodeType(node, ruleSymbolArg)
++			symbol := input.contents[node.begin:node.end]
++			if _, ok := localEntrySymbols[symbol]; ok {
++				panic(fmt.Sprintf("Duplicate .localentry directive found: %q in %q", symbol, input.path))
++			}
++			localEntrySymbols[symbol] = struct{}{}
++		}, ruleStatement, ruleLabelContainingDirective)
++
+ 		forEachPath(input.ast.up, func(node *node32) {
+ 			assertNodeType(node, ruleLocationDirective)
+ 			directive := input.contents[node.begin:node.end]
+@@ -1338,11 +1765,13 @@ func transform(w stringWriter, inputs []inputFile) error {
+ 
+ 	d := &delocation{
+ 		symbols:             symbols,
++		localEntrySymbols:   localEntrySymbols,
+ 		processor:           processor,
+ 		commentIndicator:    commentIndicator,
+ 		output:              w,
+ 		redirectors:         make(map[string]string),
+ 		bssAccessorsNeeded:  make(map[string]string),
++		tocLoaders:          make(map[string]struct{}),
+ 		gotExternalsNeeded:  make(map[string]struct{}),
+ 		gotOffsetsNeeded:    make(map[string]struct{}),
+ 		gotOffOffsetsNeeded: make(map[string]struct{}),
+@@ -1377,6 +1806,22 @@ func transform(w stringWriter, inputs []inputFile) error {
+ 	for _, name := range redirectorNames {
+ 		redirector := d.redirectors[name]
+ 		switch d.processor {
++		case ppc64le:
++			w.WriteString(".section \".toc\", \"aw\"\n")
++			w.WriteString(".Lredirector_toc_" + name + ":\n")
++			w.WriteString(".quad " + name + "\n")
++			w.WriteString(".text\n")
++			w.WriteString(".type " + redirector + ", @function\n")
++			w.WriteString(redirector + ":\n")
++			// |name| will clobber r2, so save it. This is matched by a restore in
++			// redirector calls.
++			w.WriteString("\tstd 2, 24(1)\n")
++			// Load and call |name|'s global entry point.
++			w.WriteString("\taddis 12, 2, .Lredirector_toc_" + name + "@toc@ha\n")
++			w.WriteString("\tld 12, .Lredirector_toc_" + name + "@toc@l(12)\n")
++			w.WriteString("\tmtctr 12\n")
++			w.WriteString("\tbctr\n")
++
+ 		case aarch64:
+ 			writeAarch64Function(w, redirector, func(w stringWriter) {
+ 				w.WriteString("\tb " + name + "\n")
+@@ -1401,6 +1846,13 @@ func transform(w stringWriter, inputs []inputFile) error {
+ 		target := d.bssAccessorsNeeded[name]
+ 
+ 		switch d.processor {
++		case ppc64le:
++			w.WriteString(".type " + funcName + ", @function\n")
++			w.WriteString(funcName + ":\n")
++			w.WriteString("\taddis 3, 2, " + target + "@toc@ha\n")
++			w.WriteString("\taddi 3, 3, " + target + "@toc@l\n")
++			w.WriteString("\tblr\n")
++
+ 		case x86_64:
+ 			w.WriteString(".type " + funcName + ", @function\n")
+ 			w.WriteString(funcName + ":\n")
+@@ -1416,6 +1868,26 @@ func transform(w stringWriter, inputs []inputFile) error {
+ 	}
+ 
+ 	switch d.processor {
++	case ppc64le:
++		loadTOCNames := sortedSet(d.tocLoaders)
++		for _, symbolAndOffset := range loadTOCNames {
++			parts := strings.SplitN(symbolAndOffset, "\x00", 2)
++			symbol, offset := parts[0], parts[1]
++
++			funcName := loadTOCFuncName(symbol, offset)
++			ref := symbol + offset
++
++			w.WriteString(".type " + funcName[2:] + ", @function\n")
++			w.WriteString(funcName[2:] + ":\n")
++			w.WriteString(funcName + ":\n")
++			w.WriteString("\taddis 3, 2, " + ref + "@toc@ha\n")
++			w.WriteString("\taddi 3, 3, " + ref + "@toc@l\n")
++			w.WriteString("\tblr\n")
++		}
++
++		w.WriteString(".LBORINGSSL_external_toc:\n")
++		w.WriteString(".quad .TOC.-.LBORINGSSL_external_toc\n")
++
+ 	case aarch64:
+ 		externalNames := sortedSet(d.gotExternalsNeeded)
+ 		for _, symbol := range externalNames {
+@@ -1729,6 +2201,10 @@ func localTargetName(name string) string {
+ 	return ".L" + name + "_local_target"
+ }
+ 
++func localEntryName(name string) string {
++	return ".L" + name + "_local_entry"
++}
++
+ func isSynthesized(symbol string) bool {
+ 	return strings.HasSuffix(symbol, "_bss_get") ||
+ 		symbol == "OPENSSL_ia32cap_get" ||
+@@ -1784,6 +2260,8 @@ func detectProcessor(input inputFile) processorType {
+ 		switch instructionName {
+ 		case "movq", "call", "leaq":
+ 			return x86_64
++		case "addis", "addi", "mflr":
++			return ppc64le
+ 		case "str", "bl", "ldr", "st1":
+ 			return aarch64
+ 		}
+--- a/src/util/fipstools/delocate/delocate_test.go
++++ b/src/util/fipstools/delocate/delocate_test.go
+@@ -39,6 +39,11 @@ func (test *delocateTest) Path(file string) string {
+ 
+ var delocateTests = []delocateTest{
+ 	{"generic-FileDirectives", []string{"in.s"}, "out.s"},
++	{"ppc64le-GlobalEntry", []string{"in.s"}, "out.s"},
++	{"ppc64le-LoadToR0", []string{"in.s"}, "out.s"},
++	{"ppc64le-Sample2", []string{"in.s"}, "out.s"},
++	{"ppc64le-Sample", []string{"in.s"}, "out.s"},
++	{"ppc64le-TOCWithOffset", []string{"in.s"}, "out.s"},
+ 	{"x86_64-Basic", []string{"in.s"}, "out.s"},
+ 	{"x86_64-BSS", []string{"in.s"}, "out.s"},
+ 	{"x86_64-GOTRewrite", []string{"in.s"}, "out.s"},
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-GlobalEntry/in.s
+@@ -0,0 +1,9 @@
++	.text
++foo:
++.LCF0:
++0:
++	addis 2,12,.TOC.-.LCF0@ha
++	addi 2,2,.TOC.-.LCF0@l
++	.localentry foo,.-foo
++.LVL0:
++	bl
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-GlobalEntry/out.s
+@@ -0,0 +1,62 @@
++.text
++.file 1 "inserted_by_delocate.c"
++.loc 1 1 0
++BORINGSSL_bcm_text_start:
++	.text
++.Lfoo_local_target:
++foo:
++.LCF0:
++
++0:
++
++999:
++	addis 2, 12, .LBORINGSSL_external_toc-999b@ha
++	addi 2, 2, .LBORINGSSL_external_toc-999b@l
++	ld 12, 0(2)
++	add 2, 2, 12
++# WAS addi 2,2,.TOC.-.LCF0@l
++	.localentry foo,.-foo
++.Lfoo_local_entry:
++.LVL0:
++
++	bl
++.text
++.loc 1 2 0
++BORINGSSL_bcm_text_end:
++.LBORINGSSL_external_toc:
++.quad .TOC.-.LBORINGSSL_external_toc
++.type BORINGSSL_bcm_text_hash, @object
++.size BORINGSSL_bcm_text_hash, 32
++BORINGSSL_bcm_text_hash:
++.byte 0xae
++.byte 0x2c
++.byte 0xea
++.byte 0x2a
++.byte 0xbd
++.byte 0xa6
++.byte 0xf3
++.byte 0xec
++.byte 0x97
++.byte 0x7f
++.byte 0x9b
++.byte 0xf6
++.byte 0x94
++.byte 0x9a
++.byte 0xfc
++.byte 0x83
++.byte 0x68
++.byte 0x27
++.byte 0xcb
++.byte 0xa0
++.byte 0xa0
++.byte 0x9f
++.byte 0x6b
++.byte 0x6f
++.byte 0xde
++.byte 0x52
++.byte 0xcd
++.byte 0xe2
++.byte 0xcd
++.byte 0xff
++.byte 0x31
++.byte 0x80
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-LoadToR0/in.s
+@@ -0,0 +1,4 @@
++	.text
++foo:
++	addis 22,2,bar@toc@ha
++	ld 0,bar@toc@l(22)
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-LoadToR0/out.s
+@@ -0,0 +1,72 @@
++.text
++.file 1 "inserted_by_delocate.c"
++.loc 1 1 0
++BORINGSSL_bcm_text_start:
++	.text
++.Lfoo_local_target:
++foo:
++# WAS addis 22,2,bar@toc@ha
++# WAS ld 0,bar@toc@l(22)
++	addi 1, 1, -288
++	mflr 0
++	std 0, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc_bar
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 0, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	addi 1, 1, -288
++	std 3, -8(1)
++	mr 3, 0
++	ld 0, 0(3)
++	ld 3, -8(1)
++	addi 1, 1, 288
++.text
++.loc 1 2 0
++BORINGSSL_bcm_text_end:
++.type bcm_loadtoc_bar, @function
++bcm_loadtoc_bar:
++.Lbcm_loadtoc_bar:
++	addis 3, 2, bar@toc@ha
++	addi 3, 3, bar@toc@l
++	blr
++.LBORINGSSL_external_toc:
++.quad .TOC.-.LBORINGSSL_external_toc
++.type BORINGSSL_bcm_text_hash, @object
++.size BORINGSSL_bcm_text_hash, 32
++BORINGSSL_bcm_text_hash:
++.byte 0xae
++.byte 0x2c
++.byte 0xea
++.byte 0x2a
++.byte 0xbd
++.byte 0xa6
++.byte 0xf3
++.byte 0xec
++.byte 0x97
++.byte 0x7f
++.byte 0x9b
++.byte 0xf6
++.byte 0x94
++.byte 0x9a
++.byte 0xfc
++.byte 0x83
++.byte 0x68
++.byte 0x27
++.byte 0xcb
++.byte 0xa0
++.byte 0xa0
++.byte 0x9f
++.byte 0x6b
++.byte 0x6f
++.byte 0xde
++.byte 0x52
++.byte 0xcd
++.byte 0xe2
++.byte 0xcd
++.byte 0xff
++.byte 0x31
++.byte 0x80
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-Sample/in.s
+@@ -0,0 +1,161 @@
++	.file	"foo.c"
++	.abiversion 2
++	.section	".toc","aw"
++	.section	".text"
++	.section	.rodata
++	.align 3
++	.type	kString, @object
++	.size	kString, 12
++kString:
++	.string	"hello world"
++	.globl kExportedString
++	.align 3
++	.type	kExportedString, @object
++	.size	kExportedString, 26
++kExportedString:
++	.string	"hello world, more visibly"
++	.align 2
++	.type	kGiantArray, @object
++	.size	kGiantArray, 400000
++kGiantArray:
++	.long	1
++	.long	0
++	.zero	399992
++	.lcomm	bss,20,4
++	.type	bss, @object
++	.align 3
++.LC1:
++	.string	"kString is %p\n"
++	.align 3
++.LC2:
++	.string	"kExportedString is %p\n"
++	.align 3
++.LC4:
++	.string	"function is %p\n"
++	.align 3
++.LC5:
++	.string	"exported_function is %p\n"
++	.align 3
++.LC7:
++	.string	"&kString[5] is %p\n"
++	.align 3
++.LC9:
++	.string	"&kGiantArray[0x12345] is %p\n"
++	.section	".toc","aw"
++.LC0:
++	.quad	stderr
++.LC3:
++	.quad	kExportedString
++.LC6:
++	.quad	exported_function
++.LC8:
++	.quad	kString+5
++.LC10:
++	.quad	kGiantArray+298260
++	.section	".text"
++	.align 2
++	.type	function, @function
++function:
++0:	addis 2,12,.TOC.-0b@ha
++	addi 2,2,.TOC.-0b@l
++	.localentry	function,.-function
++	mflr 0
++	std 0,16(1)
++	std 31,-8(1)
++	stdu 1,-112(1)
++	mr 31,1
++	addis 10,2,.LC0@toc@ha
++	ld 9,.LC0@toc@l(10)
++	ld 9,0(9)
++	mr 3,9
++	addis 4,2,.LC1@toc@ha
++	addi 4,4,.LC1@toc@l
++	addis 5,2,kString@toc@ha
++	addi 5,5,kString@toc@l
++	bl fprintf
++	nop
++	addis 10,2,.LC0@toc@ha
++	ld 9,.LC0@toc@l(10)
++	ld 9,0(9)
++	mr 3,9
++	addis 4,2,.LC2@toc@ha
++	addi 4,4,.LC2@toc@l
++	addis 9,2,.LC3@toc@ha
++	ld 5,.LC3@toc@l(9)
++	bl fprintf
++	nop
++	addis 10,2,.LC0@toc@ha
++	ld 9,.LC0@toc@l(10)
++	ld 9,0(9)
++	mr 3,9
++	addis 4,2,.LC4@toc@ha
++	addi 4,4,.LC4@toc@l
++	addis 5,2,function@toc@ha
++	addi 5,5,function@toc@l
++	bl fprintf
++	nop
++	addis 10,2,.LC0@toc@ha
++	ld 9,.LC0@toc@l(10)
++	ld 9,0(9)
++	mr 3,9
++	addis 4,2,.LC5@toc@ha
++	addi 4,4,.LC5@toc@l
++	addis 9,2,.LC6@toc@ha
++	ld 5,.LC6@toc@l(9)
++	bl fprintf
++	nop
++	addis 10,2,.LC0@toc@ha
++	ld 9,.LC0@toc@l(10)
++	ld 9,0(9)
++	mr 3,9
++	addis 4,2,.LC7@toc@ha
++	addi 4,4,.LC7@toc@l
++	addis 9,2,.LC8@toc@ha
++	ld 5,.LC8@toc@l(9)
++	bl fprintf
++	nop
++	addis 10,2,.LC0@toc@ha
++	ld 9,.LC0@toc@l(10)
++	ld 9,0(9)
++	mr 3,9
++	addis 4,2,.LC9@toc@ha
++	addi 4,4,.LC9@toc@l
++	addis 9,2,.LC10@toc@ha
++	ld 5,.LC10@toc@l(9)
++	bl fprintf
++	nop
++	bl exported_function
++	nop
++	mr 3,9
++	addi 1,31,112
++	ld 0,16(1)
++	mtlr 0
++	ld 31,-8(1)
++	blr
++	.long 0
++	.byte 0,0,0,1,128,1,0,1
++	.size	function,.-function
++	.align 2
++	.globl exported_function
++	.type	exported_function, @function
++exported_function:
++0:	addis 2,12,.TOC.-0b@ha
++	addi 2,2,.TOC.-0b@l
++	.localentry	exported_function,.-exported_function
++	mflr 0
++	std 0,16(1)
++	std 31,-8(1)
++	stdu 1,-48(1)
++	mr 31,1
++	bl function
++	mr 3,9
++	addi 1,31,48
++	ld 0,16(1)
++	mtlr 0
++	ld 31,-8(1)
++	blr
++	.long 0
++	.byte 0,0,0,1,128,1,0,1
++	.size	exported_function,.-exported_function
++	.ident	"GCC: (Ubuntu 4.9.2-10ubuntu13) 4.9.2"
++	.section	.note.GNU-stack,"",@progbits
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-Sample/out.s
+@@ -0,0 +1,552 @@
++.text
++.file 1 "inserted_by_delocate.c"
++.loc 1 1 0
++BORINGSSL_bcm_text_start:
++	.file	"foo.c"
++	.abiversion 2
++	.section	".toc","aw"
++# WAS .section	".text"
++.text
++# WAS .section	.rodata
++.text
++	.align 3
++	.type	kString, @object
++	.size	kString, 12
++.LkString_local_target:
++kString:
++	.string	"hello world"
++	.globl kExportedString
++	.align 3
++	.type	kExportedString, @object
++	.size	kExportedString, 26
++.LkExportedString_local_target:
++kExportedString:
++	.string	"hello world, more visibly"
++	.align 2
++	.type	kGiantArray, @object
++	.size	kGiantArray, 400000
++.LkGiantArray_local_target:
++kGiantArray:
++	.long	1
++	.long	0
++	.zero	399992
++	.lcomm	bss,20,4
++	.type	bss, @object
++	.align 3
++.LC1:
++
++	.string	"kString is %p\n"
++	.align 3
++.LC2:
++
++	.string	"kExportedString is %p\n"
++	.align 3
++.LC4:
++
++	.string	"function is %p\n"
++	.align 3
++.LC5:
++
++	.string	"exported_function is %p\n"
++	.align 3
++.LC7:
++
++	.string	"&kString[5] is %p\n"
++	.align 3
++.LC9:
++
++	.string	"&kGiantArray[0x12345] is %p\n"
++	.section	".toc","aw"
++.LC0:
++
++	.quad	stderr
++.LC3:
++
++	.quad	kExportedString
++.LC6:
++
++	.quad	exported_function
++.LC8:
++
++	.quad	kString+5
++.LC10:
++
++	.quad	kGiantArray+298260
++# WAS .section	".text"
++.text
++	.align 2
++	.type	function, @function
++.Lfunction_local_target:
++function:
++0:
++999:
++	addis 2, 12, .LBORINGSSL_external_toc-999b@ha
++	addi 2, 2, .LBORINGSSL_external_toc-999b@l
++	ld 12, 0(2)
++	add 2, 2, 12
++# WAS addi 2,2,.TOC.-0b@l
++	.localentry	function,.-function
++.Lfunction_local_entry:
++	mflr 0
++	std 0,16(1)
++	std 31,-8(1)
++	stdu 1,-112(1)
++	mr 31,1
++# WAS addis 10,2,.LC0@toc@ha
++# WAS ld 9,.LC0@toc@l(10)
++	addi 1, 1, -288
++	mflr 9
++	std 9, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 9, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 9, 0(9)
++	ld 9,0(9)
++	mr 3,9
++# WAS addis 4,2,.LC1@toc@ha
++# WAS addi 4,4,.LC1@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC1
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addis 5,2,kString@toc@ha
++# WAS addi 5,5,kString@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LkString_local_target
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS bl fprintf
++	bl	bcm_redirector_fprintf
++	ld 2, 24(1)
++	nop
++# WAS addis 10,2,.LC0@toc@ha
++# WAS ld 9,.LC0@toc@l(10)
++	addi 1, 1, -288
++	mflr 9
++	std 9, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 9, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 9, 0(9)
++	ld 9,0(9)
++	mr 3,9
++# WAS addis 4,2,.LC2@toc@ha
++# WAS addi 4,4,.LC2@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC2
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addis 9,2,.LC3@toc@ha
++# WAS ld 5,.LC3@toc@l(9)
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC3
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 5, 0(5)
++# WAS bl fprintf
++	bl	bcm_redirector_fprintf
++	ld 2, 24(1)
++	nop
++# WAS addis 10,2,.LC0@toc@ha
++# WAS ld 9,.LC0@toc@l(10)
++	addi 1, 1, -288
++	mflr 9
++	std 9, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 9, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 9, 0(9)
++	ld 9,0(9)
++	mr 3,9
++# WAS addis 4,2,.LC4@toc@ha
++# WAS addi 4,4,.LC4@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC4
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addis 5,2,function@toc@ha
++# WAS addi 5,5,function@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfunction_local_target
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS bl fprintf
++	bl	bcm_redirector_fprintf
++	ld 2, 24(1)
++	nop
++# WAS addis 10,2,.LC0@toc@ha
++# WAS ld 9,.LC0@toc@l(10)
++	addi 1, 1, -288
++	mflr 9
++	std 9, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 9, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 9, 0(9)
++	ld 9,0(9)
++	mr 3,9
++# WAS addis 4,2,.LC5@toc@ha
++# WAS addi 4,4,.LC5@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC5
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addis 9,2,.LC6@toc@ha
++# WAS ld 5,.LC6@toc@l(9)
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC6
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 5, 0(5)
++# WAS bl fprintf
++	bl	bcm_redirector_fprintf
++	ld 2, 24(1)
++	nop
++# WAS addis 10,2,.LC0@toc@ha
++# WAS ld 9,.LC0@toc@l(10)
++	addi 1, 1, -288
++	mflr 9
++	std 9, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 9, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 9, 0(9)
++	ld 9,0(9)
++	mr 3,9
++# WAS addis 4,2,.LC7@toc@ha
++# WAS addi 4,4,.LC7@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC7
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addis 9,2,.LC8@toc@ha
++# WAS ld 5,.LC8@toc@l(9)
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC8
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 5, 0(5)
++# WAS bl fprintf
++	bl	bcm_redirector_fprintf
++	ld 2, 24(1)
++	nop
++# WAS addis 10,2,.LC0@toc@ha
++# WAS ld 9,.LC0@toc@l(10)
++	addi 1, 1, -288
++	mflr 9
++	std 9, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 9, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 9, 0(9)
++	ld 9,0(9)
++	mr 3,9
++# WAS addis 4,2,.LC9@toc@ha
++# WAS addi 4,4,.LC9@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC9
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addis 9,2,.LC10@toc@ha
++# WAS ld 5,.LC10@toc@l(9)
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC10
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 5, 0(5)
++# WAS bl fprintf
++	bl	bcm_redirector_fprintf
++	ld 2, 24(1)
++	nop
++# WAS bl exported_function
++	bl	.Lexported_function_local_entry
++	nop
++	mr 3,9
++	addi 1,31,112
++	ld 0,16(1)
++	mtlr 0
++	ld 31,-8(1)
++	blr
++	.long 0
++	.byte 0,0,0,1,128,1,0,1
++	.size	function,.-function
++	.align 2
++	.globl exported_function
++	.type	exported_function, @function
++.Lexported_function_local_target:
++exported_function:
++0:
++999:
++	addis 2, 12, .LBORINGSSL_external_toc-999b@ha
++	addi 2, 2, .LBORINGSSL_external_toc-999b@l
++	ld 12, 0(2)
++	add 2, 2, 12
++# WAS addi 2,2,.TOC.-0b@l
++	.localentry	exported_function,.-exported_function
++.Lexported_function_local_entry:
++	mflr 0
++	std 0,16(1)
++	std 31,-8(1)
++	stdu 1,-48(1)
++	mr 31,1
++# WAS bl function
++	bl	.Lfunction_local_entry
++	mr 3,9
++	addi 1,31,48
++	ld 0,16(1)
++	mtlr 0
++	ld 31,-8(1)
++	blr
++	.long 0
++	.byte 0,0,0,1,128,1,0,1
++	.size	exported_function,.-exported_function
++	.ident	"GCC: (Ubuntu 4.9.2-10ubuntu13) 4.9.2"
++	.section	.note.GNU-stack,"",@progbits
++.text
++.loc 1 2 0
++BORINGSSL_bcm_text_end:
++.section ".toc", "aw"
++.Lredirector_toc_fprintf:
++.quad fprintf
++.text
++.type bcm_redirector_fprintf, @function
++bcm_redirector_fprintf:
++	std 2, 24(1)
++	addis 12, 2, .Lredirector_toc_fprintf@toc@ha
++	ld 12, .Lredirector_toc_fprintf@toc@l(12)
++	mtctr 12
++	bctr
++.type bss_bss_get, @function
++bss_bss_get:
++	addis 3, 2, bss@toc@ha
++	addi 3, 3, bss@toc@l
++	blr
++.type bcm_loadtoc__dot_LC0, @function
++bcm_loadtoc__dot_LC0:
++.Lbcm_loadtoc__dot_LC0:
++	addis 3, 2, .LC0@toc@ha
++	addi 3, 3, .LC0@toc@l
++	blr
++.type bcm_loadtoc__dot_LC1, @function
++bcm_loadtoc__dot_LC1:
++.Lbcm_loadtoc__dot_LC1:
++	addis 3, 2, .LC1@toc@ha
++	addi 3, 3, .LC1@toc@l
++	blr
++.type bcm_loadtoc__dot_LC10, @function
++bcm_loadtoc__dot_LC10:
++.Lbcm_loadtoc__dot_LC10:
++	addis 3, 2, .LC10@toc@ha
++	addi 3, 3, .LC10@toc@l
++	blr
++.type bcm_loadtoc__dot_LC2, @function
++bcm_loadtoc__dot_LC2:
++.Lbcm_loadtoc__dot_LC2:
++	addis 3, 2, .LC2@toc@ha
++	addi 3, 3, .LC2@toc@l
++	blr
++.type bcm_loadtoc__dot_LC3, @function
++bcm_loadtoc__dot_LC3:
++.Lbcm_loadtoc__dot_LC3:
++	addis 3, 2, .LC3@toc@ha
++	addi 3, 3, .LC3@toc@l
++	blr
++.type bcm_loadtoc__dot_LC4, @function
++bcm_loadtoc__dot_LC4:
++.Lbcm_loadtoc__dot_LC4:
++	addis 3, 2, .LC4@toc@ha
++	addi 3, 3, .LC4@toc@l
++	blr
++.type bcm_loadtoc__dot_LC5, @function
++bcm_loadtoc__dot_LC5:
++.Lbcm_loadtoc__dot_LC5:
++	addis 3, 2, .LC5@toc@ha
++	addi 3, 3, .LC5@toc@l
++	blr
++.type bcm_loadtoc__dot_LC6, @function
++bcm_loadtoc__dot_LC6:
++.Lbcm_loadtoc__dot_LC6:
++	addis 3, 2, .LC6@toc@ha
++	addi 3, 3, .LC6@toc@l
++	blr
++.type bcm_loadtoc__dot_LC7, @function
++bcm_loadtoc__dot_LC7:
++.Lbcm_loadtoc__dot_LC7:
++	addis 3, 2, .LC7@toc@ha
++	addi 3, 3, .LC7@toc@l
++	blr
++.type bcm_loadtoc__dot_LC8, @function
++bcm_loadtoc__dot_LC8:
++.Lbcm_loadtoc__dot_LC8:
++	addis 3, 2, .LC8@toc@ha
++	addi 3, 3, .LC8@toc@l
++	blr
++.type bcm_loadtoc__dot_LC9, @function
++bcm_loadtoc__dot_LC9:
++.Lbcm_loadtoc__dot_LC9:
++	addis 3, 2, .LC9@toc@ha
++	addi 3, 3, .LC9@toc@l
++	blr
++.type bcm_loadtoc__dot_Lfunction_local_target, @function
++bcm_loadtoc__dot_Lfunction_local_target:
++.Lbcm_loadtoc__dot_Lfunction_local_target:
++	addis 3, 2, .Lfunction_local_target@toc@ha
++	addi 3, 3, .Lfunction_local_target@toc@l
++	blr
++.type bcm_loadtoc__dot_LkString_local_target, @function
++bcm_loadtoc__dot_LkString_local_target:
++.Lbcm_loadtoc__dot_LkString_local_target:
++	addis 3, 2, .LkString_local_target@toc@ha
++	addi 3, 3, .LkString_local_target@toc@l
++	blr
++.LBORINGSSL_external_toc:
++.quad .TOC.-.LBORINGSSL_external_toc
++.type BORINGSSL_bcm_text_hash, @object
++.size BORINGSSL_bcm_text_hash, 32
++BORINGSSL_bcm_text_hash:
++.byte 0xae
++.byte 0x2c
++.byte 0xea
++.byte 0x2a
++.byte 0xbd
++.byte 0xa6
++.byte 0xf3
++.byte 0xec
++.byte 0x97
++.byte 0x7f
++.byte 0x9b
++.byte 0xf6
++.byte 0x94
++.byte 0x9a
++.byte 0xfc
++.byte 0x83
++.byte 0x68
++.byte 0x27
++.byte 0xcb
++.byte 0xa0
++.byte 0xa0
++.byte 0x9f
++.byte 0x6b
++.byte 0x6f
++.byte 0xde
++.byte 0x52
++.byte 0xcd
++.byte 0xe2
++.byte 0xcd
++.byte 0xff
++.byte 0x31
++.byte 0x80
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-Sample2/in.s
+@@ -0,0 +1,226 @@
++	.file	"foo.c"
++	.abiversion 2
++	.section	".toc","aw"
++	.section	".text"
++	.section	".toc","aw"
++.LC0:
++	.quad	stderr
++.LC3:
++	.quad	kExportedString
++.LC6:
++	.quad	exported_function
++	.section	".text"
++	.align 2
++	.p2align 4,,15
++	.globl exported_function
++	.type	exported_function, @function
++exported_function:
++0:	addis 2,12,.TOC.-0b@ha
++	addi 2,2,.TOC.-0b@l
++	.localentry	exported_function,.-exported_function
++	mflr 0
++	std 19,-104(1)
++	std 20,-96(1)
++	std 21,-88(1)
++	std 22,-80(1)
++	addis 21,2,.LC1@toc@ha
++	addis 22,2,.LC2@toc@ha
++	std 23,-72(1)
++	std 24,-64(1)
++	addis 23,2,.LC4@toc@ha
++	addis 24,2,function@toc@ha
++	std 25,-56(1)
++	std 26,-48(1)
++	addis 25,2,.LC5@toc@ha
++	addis 26,2,.LC7@toc@ha
++	std 27,-40(1)
++	std 28,-32(1)
++	addis 28,2,.LC8@toc@ha
++	addi 21,21,.LC1@toc@l
++	std 29,-24(1)
++	std 30,-16(1)
++	addis 29,2,.LANCHOR0@toc@ha
++	addi 22,22,.LC2@toc@l
++	std 31,-8(1)
++	std 0,16(1)
++	addi 29,29,.LANCHOR0@toc@l
++	addi 23,23,.LC4@toc@l
++	stdu 1,-208(1)
++	addis 31,2,.LC0@toc@ha		# gpr load fusion, type long
++	ld 31,.LC0@toc@l(31)
++	addis 19,2,.LC3@toc@ha		# gpr load fusion, type long
++	ld 19,.LC3@toc@l(19)
++	addis 30,29,0x5
++	addi 24,24,function@toc@l
++	addis 20,2,.LC6@toc@ha		# gpr load fusion, type long
++	ld 20,.LC6@toc@l(20)
++	addi 25,25,.LC5@toc@l
++	addi 26,26,.LC7@toc@l
++	addi 27,29,5
++	addi 28,28,.LC8@toc@l
++	addi 30,30,-29404
++	.p2align 4,,15
++.L2:
++	ld 3,0(31)
++	mr 5,21
++	mr 6,29
++	li 4,1
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	mr 5,22
++	mr 6,19
++	li 4,1
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	mr 5,23
++	mr 6,24
++	li 4,1
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	mr 5,25
++	mr 6,20
++	li 4,1
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	mr 5,26
++	mr 6,27
++	li 4,1
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	li 4,1
++	mr 5,28
++	mr 6,30
++	bl __fprintf_chk
++	nop
++	b .L2
++	.long 0
++	.byte 0,0,0,1,128,13,0,0
++	.size	exported_function,.-exported_function
++	.section	".toc","aw"
++	.set .LC11,.LC0
++	.set .LC12,.LC3
++	.set .LC13,.LC6
++	.section	".text"
++	.align 2
++	.p2align 4,,15
++	.type	function, @function
++function:
++0:	addis 2,12,.TOC.-0b@ha
++	addi 2,2,.TOC.-0b@l
++	.localentry	function,.-function
++	mflr 0
++	std 31,-8(1)
++	addis 31,2,.LC11@toc@ha		# gpr load fusion, type long
++	ld 31,.LC11@toc@l(31)
++	addis 5,2,.LC1@toc@ha
++	std 30,-16(1)
++	addis 30,2,.LANCHOR0@toc@ha
++	addi 5,5,.LC1@toc@l
++	addi 30,30,.LANCHOR0@toc@l
++	li 4,1
++	mr 6,30
++	std 0,16(1)
++	stdu 1,-112(1)
++	ld 3,0(31)
++	bl __fprintf_chk
++	nop
++	addis 6,2,.LC12@toc@ha		# gpr load fusion, type long
++	ld 6,.LC12@toc@l(6)
++	ld 3,0(31)
++	addis 5,2,.LC2@toc@ha
++	li 4,1
++	addi 5,5,.LC2@toc@l
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	addis 5,2,.LC4@toc@ha
++	addis 6,2,function@toc@ha
++	addi 5,5,.LC4@toc@l
++	addi 6,6,function@toc@l
++	li 4,1
++	bl __fprintf_chk
++	nop
++	addis 6,2,.LC13@toc@ha		# gpr load fusion, type long
++	ld 6,.LC13@toc@l(6)
++	ld 3,0(31)
++	addis 5,2,.LC5@toc@ha
++	li 4,1
++	addi 5,5,.LC5@toc@l
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	addis 5,2,.LC7@toc@ha
++	addi 6,30,5
++	addi 5,5,.LC7@toc@l
++	li 4,1
++	bl __fprintf_chk
++	nop
++	ld 3,0(31)
++	addis 6,30,0x5
++	addis 5,2,.LC8@toc@ha
++	li 4,1
++	addi 5,5,.LC8@toc@l
++	addi 6,6,-29404
++	bl __fprintf_chk
++	nop
++	bl exported_function
++	nop
++	addi 1,1,112
++	ld 0,16(1)
++	ld 30,-16(1)
++	ld 31,-8(1)
++	mtlr 0
++	blr
++	.long 0
++	.byte 0,0,0,1,128,2,0,0
++	.size	function,.-function
++	.globl kExportedString
++	.section	.rodata
++	.align 4
++	.set	.LANCHOR0,. + 0
++	.type	kString, @object
++	.size	kString, 12
++kString:
++	.string	"hello world"
++	.zero	4
++	.type	kGiantArray, @object
++	.size	kGiantArray, 400000
++kGiantArray:
++	.long	1
++	.long	0
++	.zero	399992
++	.type	kExportedString, @object
++	.size	kExportedString, 26
++kExportedString:
++	.string	"hello world, more visibly"
++	.section	.rodata.str1.8,"aMS",@progbits,1
++	.align 3
++.LC1:
++	.string	"kString is %p\n"
++	.zero	1
++.LC2:
++	.string	"kExportedString is %p\n"
++	.zero	1
++.LC4:
++	.string	"function is %p\n"
++.LC5:
++	.string	"exported_function is %p\n"
++	.zero	7
++.LC7:
++	.string	"&kString[5] is %p\n"
++	.zero	5
++.LC8:
++	.string	"&kGiantArray[0x12345] is %p\n"
++	.section	".bss"
++	.align 2
++	.type	bss, @object
++	.size	bss, 20
++bss:
++	.zero	20
++	.ident	"GCC: (Ubuntu 4.9.2-10ubuntu13) 4.9.2"
++	.section	.note.GNU-stack,"",@progbits
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-Sample2/out.s
+@@ -0,0 +1,677 @@
++.text
++.file 1 "inserted_by_delocate.c"
++.loc 1 1 0
++BORINGSSL_bcm_text_start:
++	.file	"foo.c"
++	.abiversion 2
++	.section	".toc","aw"
++# WAS .section	".text"
++.text
++	.section	".toc","aw"
++.LC0:
++
++	.quad	stderr
++.LC3:
++
++	.quad	kExportedString
++.LC6:
++
++	.quad	exported_function
++# WAS .section	".text"
++.text
++	.align 2
++	.p2align 4,,15
++	.globl exported_function
++	.type	exported_function, @function
++.Lexported_function_local_target:
++exported_function:
++0:
++999:
++	addis 2, 12, .LBORINGSSL_external_toc-999b@ha
++	addi 2, 2, .LBORINGSSL_external_toc-999b@l
++	ld 12, 0(2)
++	add 2, 2, 12
++# WAS addi 2,2,.TOC.-0b@l
++	.localentry	exported_function,.-exported_function
++.Lexported_function_local_entry:
++	mflr 0
++	std 19,-104(1)
++	std 20,-96(1)
++	std 21,-88(1)
++	std 22,-80(1)
++# WAS addis 21,2,.LC1@toc@ha
++# WAS addis 22,2,.LC2@toc@ha
++	std 23,-72(1)
++	std 24,-64(1)
++# WAS addis 23,2,.LC4@toc@ha
++# WAS addis 24,2,function@toc@ha
++	std 25,-56(1)
++	std 26,-48(1)
++# WAS addis 25,2,.LC5@toc@ha
++# WAS addis 26,2,.LC7@toc@ha
++	std 27,-40(1)
++	std 28,-32(1)
++# WAS addis 28,2,.LC8@toc@ha
++# WAS addi 21,21,.LC1@toc@l
++	addi 1, 1, -288
++	mflr 21
++	std 21, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC1
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 21, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	std 29,-24(1)
++	std 30,-16(1)
++# WAS addis 29,2,.LANCHOR0@toc@ha
++# WAS addi 22,22,.LC2@toc@l
++	addi 1, 1, -288
++	mflr 22
++	std 22, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC2
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 22, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	std 31,-8(1)
++	std 0,16(1)
++# WAS addi 29,29,.LANCHOR0@toc@l
++	addi 1, 1, -288
++	mflr 29
++	std 29, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LANCHOR0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 29, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addi 23,23,.LC4@toc@l
++	addi 1, 1, -288
++	mflr 23
++	std 23, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC4
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 23, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	stdu 1,-208(1)
++# WAS addis 31,2,.LC0@toc@ha		# gpr load fusion, type long
++# WAS ld 31,.LC0@toc@l(31)
++	addi 1, 1, -288
++	mflr 31
++	std 31, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 31, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 31, 0(31)
++# WAS addis 19,2,.LC3@toc@ha		# gpr load fusion, type long
++# WAS ld 19,.LC3@toc@l(19)
++	addi 1, 1, -288
++	mflr 19
++	std 19, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC3
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 19, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 19, 0(19)
++	addis 30,29,0x5
++# WAS addi 24,24,function@toc@l
++	addi 1, 1, -288
++	mflr 24
++	std 24, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfunction_local_target
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 24, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addis 20,2,.LC6@toc@ha		# gpr load fusion, type long
++# WAS ld 20,.LC6@toc@l(20)
++	addi 1, 1, -288
++	mflr 20
++	std 20, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC6
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 20, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 20, 0(20)
++# WAS addi 25,25,.LC5@toc@l
++	addi 1, 1, -288
++	mflr 25
++	std 25, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC5
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 25, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addi 26,26,.LC7@toc@l
++	addi 1, 1, -288
++	mflr 26
++	std 26, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC7
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 26, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	addi 27,29,5
++# WAS addi 28,28,.LC8@toc@l
++	addi 1, 1, -288
++	mflr 28
++	std 28, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC8
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 28, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	addi 30,30,-29404
++	.p2align 4,,15
++.L2:
++
++	ld 3,0(31)
++	mr 5,21
++	mr 6,29
++	li 4,1
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++	mr 5,22
++	mr 6,19
++	li 4,1
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++	mr 5,23
++	mr 6,24
++	li 4,1
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++	mr 5,25
++	mr 6,20
++	li 4,1
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++	mr 5,26
++	mr 6,27
++	li 4,1
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++	li 4,1
++	mr 5,28
++	mr 6,30
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	b .L2
++	.long 0
++	.byte 0,0,0,1,128,13,0,0
++	.size	exported_function,.-exported_function
++	.section	".toc","aw"
++	.set .LC11,.LC0
++	.set .LC12,.LC3
++	.set .LC13,.LC6
++# WAS .section	".text"
++.text
++	.align 2
++	.p2align 4,,15
++	.type	function, @function
++.Lfunction_local_target:
++function:
++0:
++999:
++	addis 2, 12, .LBORINGSSL_external_toc-999b@ha
++	addi 2, 2, .LBORINGSSL_external_toc-999b@l
++	ld 12, 0(2)
++	add 2, 2, 12
++# WAS addi 2,2,.TOC.-0b@l
++	.localentry	function,.-function
++.Lfunction_local_entry:
++	mflr 0
++	std 31,-8(1)
++# WAS addis 31,2,.LC11@toc@ha		# gpr load fusion, type long
++# WAS ld 31,.LC11@toc@l(31)
++	addi 1, 1, -288
++	mflr 31
++	std 31, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC11
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 31, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 31, 0(31)
++# WAS addis 5,2,.LC1@toc@ha
++	std 30,-16(1)
++# WAS addis 30,2,.LANCHOR0@toc@ha
++# WAS addi 5,5,.LC1@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC1
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addi 30,30,.LANCHOR0@toc@l
++	addi 1, 1, -288
++	mflr 30
++	std 30, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LANCHOR0
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 30, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	li 4,1
++	mr 6,30
++	std 0,16(1)
++	stdu 1,-112(1)
++	ld 3,0(31)
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++# WAS addis 6,2,.LC12@toc@ha		# gpr load fusion, type long
++# WAS ld 6,.LC12@toc@l(6)
++	addi 1, 1, -288
++	mflr 6
++	std 6, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC12
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 6, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 6, 0(6)
++	ld 3,0(31)
++# WAS addis 5,2,.LC2@toc@ha
++	li 4,1
++# WAS addi 5,5,.LC2@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC2
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++# WAS addis 5,2,.LC4@toc@ha
++# WAS addis 6,2,function@toc@ha
++# WAS addi 5,5,.LC4@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC4
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS addi 6,6,function@toc@l
++	addi 1, 1, -288
++	mflr 6
++	std 6, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfunction_local_target
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 6, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	li 4,1
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++# WAS addis 6,2,.LC13@toc@ha		# gpr load fusion, type long
++# WAS ld 6,.LC13@toc@l(6)
++	addi 1, 1, -288
++	mflr 6
++	std 6, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC13
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 6, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 6, 0(6)
++	ld 3,0(31)
++# WAS addis 5,2,.LC5@toc@ha
++	li 4,1
++# WAS addi 5,5,.LC5@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC5
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++# WAS addis 5,2,.LC7@toc@ha
++	addi 6,30,5
++# WAS addi 5,5,.LC7@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC7
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	li 4,1
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++	ld 3,0(31)
++	addis 6,30,0x5
++# WAS addis 5,2,.LC8@toc@ha
++	li 4,1
++# WAS addi 5,5,.LC8@toc@l
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_LC8
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	addi 6,6,-29404
++# WAS bl __fprintf_chk
++	bl	bcm_redirector___fprintf_chk
++	ld 2, 24(1)
++	nop
++# WAS bl exported_function
++	bl	.Lexported_function_local_entry
++	nop
++	addi 1,1,112
++	ld 0,16(1)
++	ld 30,-16(1)
++	ld 31,-8(1)
++	mtlr 0
++	blr
++	.long 0
++	.byte 0,0,0,1,128,2,0,0
++	.size	function,.-function
++	.globl kExportedString
++# WAS .section	.rodata
++.text
++	.align 4
++	.set	.LANCHOR0,. + 0
++	.type	kString, @object
++	.size	kString, 12
++.LkString_local_target:
++kString:
++	.string	"hello world"
++	.zero	4
++	.type	kGiantArray, @object
++	.size	kGiantArray, 400000
++.LkGiantArray_local_target:
++kGiantArray:
++	.long	1
++	.long	0
++	.zero	399992
++	.type	kExportedString, @object
++	.size	kExportedString, 26
++.LkExportedString_local_target:
++kExportedString:
++	.string	"hello world, more visibly"
++# WAS .section	.rodata.str1.8,"aMS",@progbits,1
++.text
++	.align 3
++.LC1:
++
++	.string	"kString is %p\n"
++	.zero	1
++.LC2:
++
++	.string	"kExportedString is %p\n"
++	.zero	1
++.LC4:
++
++	.string	"function is %p\n"
++.LC5:
++
++	.string	"exported_function is %p\n"
++	.zero	7
++.LC7:
++
++	.string	"&kString[5] is %p\n"
++	.zero	5
++.LC8:
++
++	.string	"&kGiantArray[0x12345] is %p\n"
++	.section	".bss"
++	.align 2
++	.type	bss, @object
++	.size	bss, 20
++bss:
++.Lbss_local_target:
++
++	.zero	20
++	.ident	"GCC: (Ubuntu 4.9.2-10ubuntu13) 4.9.2"
++	.section	.note.GNU-stack,"",@progbits
++.text
++.loc 1 2 0
++BORINGSSL_bcm_text_end:
++.section ".toc", "aw"
++.Lredirector_toc___fprintf_chk:
++.quad __fprintf_chk
++.text
++.type bcm_redirector___fprintf_chk, @function
++bcm_redirector___fprintf_chk:
++	std 2, 24(1)
++	addis 12, 2, .Lredirector_toc___fprintf_chk@toc@ha
++	ld 12, .Lredirector_toc___fprintf_chk@toc@l(12)
++	mtctr 12
++	bctr
++.type bss_bss_get, @function
++bss_bss_get:
++	addis 3, 2, .Lbss_local_target@toc@ha
++	addi 3, 3, .Lbss_local_target@toc@l
++	blr
++.type bcm_loadtoc__dot_LANCHOR0, @function
++bcm_loadtoc__dot_LANCHOR0:
++.Lbcm_loadtoc__dot_LANCHOR0:
++	addis 3, 2, .LANCHOR0@toc@ha
++	addi 3, 3, .LANCHOR0@toc@l
++	blr
++.type bcm_loadtoc__dot_LC0, @function
++bcm_loadtoc__dot_LC0:
++.Lbcm_loadtoc__dot_LC0:
++	addis 3, 2, .LC0@toc@ha
++	addi 3, 3, .LC0@toc@l
++	blr
++.type bcm_loadtoc__dot_LC1, @function
++bcm_loadtoc__dot_LC1:
++.Lbcm_loadtoc__dot_LC1:
++	addis 3, 2, .LC1@toc@ha
++	addi 3, 3, .LC1@toc@l
++	blr
++.type bcm_loadtoc__dot_LC11, @function
++bcm_loadtoc__dot_LC11:
++.Lbcm_loadtoc__dot_LC11:
++	addis 3, 2, .LC11@toc@ha
++	addi 3, 3, .LC11@toc@l
++	blr
++.type bcm_loadtoc__dot_LC12, @function
++bcm_loadtoc__dot_LC12:
++.Lbcm_loadtoc__dot_LC12:
++	addis 3, 2, .LC12@toc@ha
++	addi 3, 3, .LC12@toc@l
++	blr
++.type bcm_loadtoc__dot_LC13, @function
++bcm_loadtoc__dot_LC13:
++.Lbcm_loadtoc__dot_LC13:
++	addis 3, 2, .LC13@toc@ha
++	addi 3, 3, .LC13@toc@l
++	blr
++.type bcm_loadtoc__dot_LC2, @function
++bcm_loadtoc__dot_LC2:
++.Lbcm_loadtoc__dot_LC2:
++	addis 3, 2, .LC2@toc@ha
++	addi 3, 3, .LC2@toc@l
++	blr
++.type bcm_loadtoc__dot_LC3, @function
++bcm_loadtoc__dot_LC3:
++.Lbcm_loadtoc__dot_LC3:
++	addis 3, 2, .LC3@toc@ha
++	addi 3, 3, .LC3@toc@l
++	blr
++.type bcm_loadtoc__dot_LC4, @function
++bcm_loadtoc__dot_LC4:
++.Lbcm_loadtoc__dot_LC4:
++	addis 3, 2, .LC4@toc@ha
++	addi 3, 3, .LC4@toc@l
++	blr
++.type bcm_loadtoc__dot_LC5, @function
++bcm_loadtoc__dot_LC5:
++.Lbcm_loadtoc__dot_LC5:
++	addis 3, 2, .LC5@toc@ha
++	addi 3, 3, .LC5@toc@l
++	blr
++.type bcm_loadtoc__dot_LC6, @function
++bcm_loadtoc__dot_LC6:
++.Lbcm_loadtoc__dot_LC6:
++	addis 3, 2, .LC6@toc@ha
++	addi 3, 3, .LC6@toc@l
++	blr
++.type bcm_loadtoc__dot_LC7, @function
++bcm_loadtoc__dot_LC7:
++.Lbcm_loadtoc__dot_LC7:
++	addis 3, 2, .LC7@toc@ha
++	addi 3, 3, .LC7@toc@l
++	blr
++.type bcm_loadtoc__dot_LC8, @function
++bcm_loadtoc__dot_LC8:
++.Lbcm_loadtoc__dot_LC8:
++	addis 3, 2, .LC8@toc@ha
++	addi 3, 3, .LC8@toc@l
++	blr
++.type bcm_loadtoc__dot_Lfunction_local_target, @function
++bcm_loadtoc__dot_Lfunction_local_target:
++.Lbcm_loadtoc__dot_Lfunction_local_target:
++	addis 3, 2, .Lfunction_local_target@toc@ha
++	addi 3, 3, .Lfunction_local_target@toc@l
++	blr
++.LBORINGSSL_external_toc:
++.quad .TOC.-.LBORINGSSL_external_toc
++.type BORINGSSL_bcm_text_hash, @object
++.size BORINGSSL_bcm_text_hash, 32
++BORINGSSL_bcm_text_hash:
++.byte 0xae
++.byte 0x2c
++.byte 0xea
++.byte 0x2a
++.byte 0xbd
++.byte 0xa6
++.byte 0xf3
++.byte 0xec
++.byte 0x97
++.byte 0x7f
++.byte 0x9b
++.byte 0xf6
++.byte 0x94
++.byte 0x9a
++.byte 0xfc
++.byte 0x83
++.byte 0x68
++.byte 0x27
++.byte 0xcb
++.byte 0xa0
++.byte 0xa0
++.byte 0x9f
++.byte 0x6b
++.byte 0x6f
++.byte 0xde
++.byte 0x52
++.byte 0xcd
++.byte 0xe2
++.byte 0xcd
++.byte 0xff
++.byte 0x31
++.byte 0x80
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-TOCWithOffset/in.s
+@@ -0,0 +1,23 @@
++	.text
++foo:
++	# TOC references may have offsets.
++	addis 3, 2, 5+foo@toc@ha
++	addi 3, 3, 10+foo@toc@l
++
++	addis 3, 2, 15+foo@toc@ha
++	addi 3, 3, 20+foo@toc@l
++
++	addis 4, 2, foo@toc@ha
++	addi 4, 4, foo@toc@l
++
++	addis 5, 2, 5+foo@toc@ha
++	ld 5, 10+foo@toc@l(5)
++
++	addis 4, 2, foo-10@toc@ha
++	addi 4, 4, foo-10@toc@l
++
++	addis 4, 2, foo@toc@ha+25
++	addi 4, 4, foo@toc@l+25
++
++	addis 4, 2, 1+foo-2@toc@ha+3
++	addi 4, 4, 1+foo-2@toc@l+3
+--- /dev/null
++++ b/src/util/fipstools/delocate/testdata/ppc64le-TOCWithOffset/out.s
+@@ -0,0 +1,178 @@
++.text
++.file 1 "inserted_by_delocate.c"
++.loc 1 1 0
++BORINGSSL_bcm_text_start:
++	.text
++.Lfoo_local_target:
++foo:
++	# TOC references may have offsets.
++# WAS addis 3, 2, 5+foo@toc@ha
++# WAS addi 3, 3, 10+foo@toc@l
++	addi 1, 1, -288
++	mflr 3
++	std 3, -8(1)
++	bl .Lbcm_loadtoc__dot_Lfoo_local_target__plus_10
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 3, -24(1)
++	addi 1, 1, 288
++
++# WAS addis 3, 2, 15+foo@toc@ha
++# WAS addi 3, 3, 20+foo@toc@l
++	addi 1, 1, -288
++	mflr 3
++	std 3, -8(1)
++	bl .Lbcm_loadtoc__dot_Lfoo_local_target__plus_20
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 3, -24(1)
++	addi 1, 1, 288
++
++# WAS addis 4, 2, foo@toc@ha
++# WAS addi 4, 4, foo@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfoo_local_target
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++
++# WAS addis 5, 2, 5+foo@toc@ha
++# WAS ld 5, 10+foo@toc@l(5)
++	addi 1, 1, -288
++	mflr 5
++	std 5, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfoo_local_target__plus_10
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 5, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++	ld 5, 0(5)
++
++# WAS addis 4, 2, foo-10@toc@ha
++# WAS addi 4, 4, foo-10@toc@l
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfoo_local_target__minus_10
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++
++# WAS addis 4, 2, foo@toc@ha+25
++# WAS addi 4, 4, foo@toc@l+25
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfoo_local_target__plus_25
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++
++# WAS addis 4, 2, 1+foo-2@toc@ha+3
++# WAS addi 4, 4, 1+foo-2@toc@l+3
++	addi 1, 1, -288
++	mflr 4
++	std 4, -8(1)
++	std 3, -16(1)
++	bl .Lbcm_loadtoc__dot_Lfoo_local_target__plus_1_minus_2_plus_3
++	std 3, -24(1)
++	ld 3, -8(1)
++	mtlr 3
++	ld 4, -24(1)
++	ld 3, -16(1)
++	addi 1, 1, 288
++.text
++.loc 1 2 0
++BORINGSSL_bcm_text_end:
++.type bcm_loadtoc__dot_Lfoo_local_target, @function
++bcm_loadtoc__dot_Lfoo_local_target:
++.Lbcm_loadtoc__dot_Lfoo_local_target:
++	addis 3, 2, .Lfoo_local_target@toc@ha
++	addi 3, 3, .Lfoo_local_target@toc@l
++	blr
++.type bcm_loadtoc__dot_Lfoo_local_target__plus_1_minus_2_plus_3, @function
++bcm_loadtoc__dot_Lfoo_local_target__plus_1_minus_2_plus_3:
++.Lbcm_loadtoc__dot_Lfoo_local_target__plus_1_minus_2_plus_3:
++	addis 3, 2, .Lfoo_local_target+1-2+3@toc@ha
++	addi 3, 3, .Lfoo_local_target+1-2+3@toc@l
++	blr
++.type bcm_loadtoc__dot_Lfoo_local_target__plus_10, @function
++bcm_loadtoc__dot_Lfoo_local_target__plus_10:
++.Lbcm_loadtoc__dot_Lfoo_local_target__plus_10:
++	addis 3, 2, .Lfoo_local_target+10@toc@ha
++	addi 3, 3, .Lfoo_local_target+10@toc@l
++	blr
++.type bcm_loadtoc__dot_Lfoo_local_target__plus_20, @function
++bcm_loadtoc__dot_Lfoo_local_target__plus_20:
++.Lbcm_loadtoc__dot_Lfoo_local_target__plus_20:
++	addis 3, 2, .Lfoo_local_target+20@toc@ha
++	addi 3, 3, .Lfoo_local_target+20@toc@l
++	blr
++.type bcm_loadtoc__dot_Lfoo_local_target__plus_25, @function
++bcm_loadtoc__dot_Lfoo_local_target__plus_25:
++.Lbcm_loadtoc__dot_Lfoo_local_target__plus_25:
++	addis 3, 2, .Lfoo_local_target+25@toc@ha
++	addi 3, 3, .Lfoo_local_target+25@toc@l
++	blr
++.type bcm_loadtoc__dot_Lfoo_local_target__minus_10, @function
++bcm_loadtoc__dot_Lfoo_local_target__minus_10:
++.Lbcm_loadtoc__dot_Lfoo_local_target__minus_10:
++	addis 3, 2, .Lfoo_local_target-10@toc@ha
++	addi 3, 3, .Lfoo_local_target-10@toc@l
++	blr
++.LBORINGSSL_external_toc:
++.quad .TOC.-.LBORINGSSL_external_toc
++.type BORINGSSL_bcm_text_hash, @object
++.size BORINGSSL_bcm_text_hash, 32
++BORINGSSL_bcm_text_hash:
++.byte 0xae
++.byte 0x2c
++.byte 0xea
++.byte 0x2a
++.byte 0xbd
++.byte 0xa6
++.byte 0xf3
++.byte 0xec
++.byte 0x97
++.byte 0x7f
++.byte 0x9b
++.byte 0xf6
++.byte 0x94
++.byte 0x9a
++.byte 0xfc
++.byte 0x83
++.byte 0x68
++.byte 0x27
++.byte 0xcb
++.byte 0xa0
++.byte 0xa0
++.byte 0x9f
++.byte 0x6b
++.byte 0x6f
++.byte 0xde
++.byte 0x52
++.byte 0xcd
++.byte 0xe2
++.byte 0xcd
++.byte 0xff
++.byte 0x31
++.byte 0x80

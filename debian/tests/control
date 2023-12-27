@@ -1,0 +1,3 @@
+Test-Command: bssl-tool genrsa
+Architecture: armel armhf arm64 amd64 i386 ppc64el mipsel mips64el alpha arc ia64 kfreebsd-amd64 kfreebsd-i386 loong64 riscv64 sh4 x32
+Depends: android-boringssl
