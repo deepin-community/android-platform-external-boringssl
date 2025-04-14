@@ -2,3 +2,4 @@
 02-sources-mk.patch
 03-Disable-failing-test.patch
 04-Revert-Remove-support-for-ppc64le.patch
+05-loong64.patch
